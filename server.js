@@ -6,7 +6,7 @@ import express from "express";
 import path from "path";
 import { fileURLToPath } from "url";
 import { chromium } from "playwright";
-import { load } from "cheerio"; // ✅ ESM-safe Cheerio import (no default)
+import { load } from "cheerio";
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -14,8 +14,7 @@ const PORT = process.env.PORT || 3000;
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// -------------------- CORS (must be BEFORE routes) --------------------
-// Allow ONLY your site to call this API from the browser.
+// -------------------- CORS --------------------
 const ALLOWED_ORIGIN = "https://joeymakesweb.com";
 
 app.use((req, res, next) => {
@@ -26,7 +25,6 @@ app.use((req, res, next) => {
   next();
 });
 
-// Handle preflight requests
 app.options("*", (req, res) => {
   res.setHeader("Access-Control-Allow-Origin", ALLOWED_ORIGIN);
   res.setHeader("Vary", "Origin");
@@ -35,17 +33,13 @@ app.options("*", (req, res) => {
   res.sendStatus(204);
 });
 
-// -------------------- Static --------------------
-app.use(express.static(path.join(__dirname, "public")));
-
-// -------------------- Simple in-memory cache --------------------
+// -------------------- Cache --------------------
 const CACHE_TTL_MS = 6 * 60 * 60 * 1000; // 6 hours
-const cache = new Map(); // key: url::hint, value: { ts, data }
+const cache = new Map(); // key: url::hint => {ts,data}
 
 function makeCacheKey(url, addressHint) {
   return `${url}::hint=${(addressHint || "").trim()}`;
 }
-
 function getCached(key) {
   const hit = cache.get(key);
   if (!hit) return null;
@@ -55,7 +49,6 @@ function getCached(key) {
   }
   return hit.data;
 }
-
 function setCached(key, data) {
   cache.set(key, { ts: Date.now(), data });
 }
@@ -64,13 +57,11 @@ function setCached(key, data) {
 function cleanText(s) {
   return (s || "").replace(/\s+/g, " ").trim();
 }
-
 function moneyToNumber(s) {
   const n = Number(String(s || "").replace(/[^0-9.]/g, ""));
   return Number.isFinite(n) ? n : null;
 }
-
-function formatMoney(n) {
+function formatMoneyCAD(n) {
   if (!Number.isFinite(n)) return "—";
   return n.toLocaleString("en-CA", {
     style: "currency",
@@ -78,7 +69,6 @@ function formatMoney(n) {
     maximumFractionDigits: 0,
   });
 }
-
 function ensureMonthlyFeesString(raw) {
   const t = cleanText(raw);
   if (!t || t === "—") return "—";
@@ -87,18 +77,25 @@ function ensureMonthlyFeesString(raw) {
 
   if (/\/\s*year/i.test(t) || /\byearly\b/i.test(t) || /\byear\b/i.test(t)) {
     const n = moneyToNumber(t);
-    if (n != null) return `${formatMoney(Math.round(n / 12))} / month`;
+    if (n != null) return `${formatMoneyCAD(Math.round(n / 12))} / month`;
     return t;
   }
 
   const n = moneyToNumber(t);
-  if (n != null && n >= 1200) return `${formatMoney(Math.round(n / 12))} / month`;
+  if (n != null && n >= 1200) return `${formatMoneyCAD(Math.round(n / 12))} / month`;
 
   return t;
 }
 
-// -------------------- Scrapers --------------------
-async function scrapeCentris(url) {
+function detectSource(url) {
+  const u = String(url || "").toLowerCase();
+  if (u.includes("centris.ca")) return "centris";
+  if (u.includes("duproprio.com")) return "duproprio";
+  return "unknown";
+}
+
+// -------------------- Shared browser helper --------------------
+async function withBrowser(fn) {
   const browser = await chromium.launch({
     headless: true,
     args: ["--no-sandbox", "--disable-setuid-sandbox"],
@@ -110,13 +107,21 @@ async function scrapeCentris(url) {
   });
 
   try {
-    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45000 });
+    return await fn(page);
+  } finally {
+    await page.close().catch(() => {});
+    await browser.close().catch(() => {});
+  }
+}
 
-    // Best-effort: wait for address to render
+// -------------------- Scrape: Centris --------------------
+async function scrapeCentris(url) {
+  return withBrowser(async (page) => {
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45000 });
     await page.waitForSelector("[itemprop='address']", { timeout: 8000 }).catch(() => {});
     await page.waitForTimeout(400);
 
-    // Best-effort: click Monthly toggle
+    // Best-effort monthly toggle
     const clickedMonthly = await page.evaluate(() => {
       const els = Array.from(document.querySelectorAll("button, a, div[role='button']"));
       const monthly = els.find((el) => (el.textContent || "").trim().toLowerCase() === "monthly");
@@ -131,7 +136,7 @@ async function scrapeCentris(url) {
     const html = await page.content();
     const $ = load(html);
 
-    // ---------------- Price ----------------
+    // Price
     let price = "—";
     const priceText =
       cleanText($("[data-cy='price']").first().text()) ||
@@ -141,7 +146,7 @@ async function scrapeCentris(url) {
       if (m) price = cleanText(m[0]);
     }
 
-    // ---------------- Caracs ----------------
+    // Caracs
     const getCarac = (label) => {
       const titles = $(".carac-title").toArray();
       for (const t of titles) {
@@ -163,7 +168,7 @@ async function scrapeCentris(url) {
     const beds = moneyToNumber(bedsStr) ?? (bedsStr ? Number(bedsStr) : null);
     const baths = moneyToNumber(bathsStr) ?? (bathsStr ? Number(bathsStr) : null);
 
-    // ---------------- Fees ----------------
+    // Fees
     let condoFees = "—";
     const feeRows = $("table tr").toArray();
     for (const r of feeRows) {
@@ -176,16 +181,14 @@ async function scrapeCentris(url) {
         }
       }
     }
-
     if (condoFees !== "—") {
       const n = moneyToNumber(condoFees);
-      if (n != null) condoFees = `${formatMoney(n)} / month`;
+      if (n != null) condoFees = `${formatMoneyCAD(n)} / month`;
     }
     condoFees = ensureMonthlyFeesString(condoFees);
 
-    // ---------------- Address ----------------
-    let address = "";
-    address =
+    // Address
+    let address =
       cleanText($("[itemprop='address']").first().text()) ||
       cleanText($("h2[itemprop='address']").first().text()) ||
       cleanText($("[data-cy='address']").first().text());
@@ -195,28 +198,7 @@ async function scrapeCentris(url) {
       if (ogTitle) address = ogTitle;
     }
 
-    if (!address) {
-      const scripts = $("script[type='application/ld+json']").toArray();
-      for (const s of scripts) {
-        try {
-          const json = JSON.parse($(s).text());
-          const items = Array.isArray(json) ? json : [json];
-          for (const it of items) {
-            const addr =
-              it?.address?.streetAddress ||
-              it?.address?.name ||
-              it?.location?.address?.streetAddress;
-            if (addr) {
-              address = cleanText(addr);
-              break;
-            }
-          }
-        } catch {}
-        if (address) break;
-      }
-    }
-
-    // ---------------- Contact ----------------
+    // Contact
     let contact = "—";
     const agentName =
       cleanText($("[data-cy='broker-name']").text()) ||
@@ -224,13 +206,12 @@ async function scrapeCentris(url) {
     const phone =
       cleanText($("[data-cy='broker-phone']").text()) ||
       cleanText($("a[href^='tel:']").first().text());
-
     if (agentName || phone) contact = cleanText([agentName, phone].filter(Boolean).join(" - "));
 
     return {
       url,
       source: "Centris",
-      address: address || "", // API enforces fallback below
+      address: address || "",
       price,
       beds: Number.isFinite(beds) ? beds : null,
       baths: Number.isFinite(baths) ? baths : null,
@@ -239,39 +220,128 @@ async function scrapeCentris(url) {
       condoFees,
       contact,
     };
-  } finally {
-    await page.close().catch(() => {});
-    await browser.close().catch(() => {});
-  }
+  });
 }
 
+// -------------------- Scrape: DuProprio --------------------
 async function scrapeDuProprio(url) {
-  // Keep your own working DuProprio scraper if you have one.
-  return {
-    url,
-    source: "DuProprio",
-    address: "",
-    price: "—",
-    beds: null,
-    baths: null,
-    levels: null,
-    area: null,
-    condoFees: "—",
-    contact: "—",
-  };
-}
+  return withBrowser(async (page) => {
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45000 });
+    await page.waitForTimeout(500);
 
-function detectSource(url) {
-  const u = String(url || "").toLowerCase();
-  if (u.includes("centris.ca")) return "centris";
-  if (u.includes("duproprio.com")) return "duproprio";
-  return "unknown";
+    const html = await page.content();
+    const $ = load(html);
+
+    // Address: DuProprio often has it in og:title or h1
+    let address =
+      cleanText($("[data-testid='listing-address']").first().text()) ||
+      cleanText($("h1").first().text());
+
+    if (!address) {
+      const ogTitle = cleanText($("meta[property='og:title']").attr("content"));
+      if (ogTitle) address = ogTitle;
+    }
+
+    // Price: try common patterns, then fallback to any $xxx,xxx in prominent text
+    let price = "—";
+    const priceCandidates = [
+      $("[data-testid='listing-price']").first().text(),
+      $("[data-testid='price']").first().text(),
+      $(".price").first().text(),
+      $("meta[property='product:price:amount']").attr("content"),
+      $("meta[property='og:price:amount']").attr("content"),
+    ]
+      .map(cleanText)
+      .filter(Boolean);
+
+    let priceText = priceCandidates[0] || "";
+    if (!priceText) {
+      const bigText = cleanText($("body").text());
+      const m = bigText.match(/\$[\s0-9]{1,3}(?:,[0-9]{3})+/);
+      if (m) priceText = m[0];
+    }
+
+    if (priceText) {
+      if (/^\d+$/.test(priceText)) price = formatMoneyCAD(Number(priceText));
+      else {
+        const m = priceText.match(/\$[\s0-9,]+/);
+        if (m) price = cleanText(m[0]);
+      }
+    }
+
+    // Helper: find a "label: value" row anywhere
+    function findValueByLabel(labels) {
+      const allTextNodes = $("body").find("*").toArray();
+      const wanted = labels.map((l) => l.toLowerCase());
+
+      for (const el of allTextNodes) {
+        const t = cleanText($(el).text());
+        if (!t || t.length > 120) continue;
+
+        const low = t.toLowerCase();
+        for (const w of wanted) {
+          if (low === w) {
+            // Try next sibling
+            const sib = cleanText($(el).next().text());
+            if (sib) return sib;
+
+            // Try parent row
+            const parent = $(el).parent();
+            const maybe = cleanText(parent.find("*").last().text());
+            if (maybe && maybe.toLowerCase() !== w) return maybe;
+          }
+        }
+      }
+      return "";
+    }
+
+    // Beds / Baths
+    const bedsStr =
+      findValueByLabel(["Bedrooms", "Beds", "Chambres"]) ||
+      cleanText($("[data-testid='bedrooms']").first().text());
+
+    const bathsStr =
+      findValueByLabel(["Bathrooms", "Baths", "Salles de bain"]) ||
+      cleanText($("[data-testid='bathrooms']").first().text());
+
+    const beds = moneyToNumber(bedsStr) ?? (bedsStr ? Number(bedsStr) : null);
+    const baths = moneyToNumber(bathsStr) ?? (bathsStr ? Number(bathsStr) : null);
+
+    // Area
+    const areaStr =
+      findValueByLabel(["Area", "Net area", "Superficie"]) ||
+      cleanText($("[data-testid='area']").first().text());
+
+    // Condo fees
+    let condoFees =
+      findValueByLabel(["Condo fees", "Condominium fees", "Frais de condo", "Frais de copropriété"]) ||
+      cleanText($("[data-testid='condo-fees']").first().text());
+
+    condoFees = cleanText(condoFees) || "—";
+    condoFees = ensureMonthlyFeesString(condoFees);
+
+    // Contact: DuProprio often does not expose a person, so leave as dash
+    const contact = "—";
+
+    return {
+      url,
+      source: "DuProprio",
+      address: address || "",
+      price,
+      beds: Number.isFinite(beds) ? beds : null,
+      baths: Number.isFinite(baths) ? baths : null,
+      levels: null,
+      area: areaStr ? cleanText(areaStr) : null,
+      condoFees,
+      contact,
+    };
+  });
 }
 
 // -------------------- API --------------------
 app.get("/api/listing", async (req, res) => {
   const url = String(req.query.url || "").trim();
-  const addressHint = String(req.query.addressHint || "").trim(); // ✅ from your SVG building dataset
+  const addressHint = String(req.query.addressHint || "").trim();
 
   if (!url) return res.status(400).json({ ok: false, error: "Missing url parameter." });
 
@@ -287,7 +357,7 @@ app.get("/api/listing", async (req, res) => {
     else if (src === "duproprio") listing = await scrapeDuProprio(url);
     else return res.status(400).json({ ok: false, error: "Unknown listing source." });
 
-    // ✅ address can never be blank
+    // Enforce: address must never be blank
     const finalListing = {
       ...listing,
       address: cleanText(listing.address) || addressHint || "—",
@@ -300,9 +370,9 @@ app.get("/api/listing", async (req, res) => {
   }
 });
 
-// -------------------- Default route --------------------
+// Health / homepage
 app.get("/", (req, res) => {
-  res.sendFile(path.join(__dirname, "public", "index.html"));
+  res.type("text").send("OK");
 });
 
 app.listen(PORT, () => {
