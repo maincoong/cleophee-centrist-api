@@ -5,7 +5,8 @@
   "private": true,
   "scripts": {
     "dev": "node server.js",
-    "start": "node server.js"
+    "start": "node server.js",
+    "postinstall": "npx playwright install"
   },
   "dependencies": {
     "cheerio": "^1.1.2",
