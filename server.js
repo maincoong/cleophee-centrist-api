@@ -40,10 +40,10 @@ app.options("*", (req, res) => {
 
 // -------------------- Simple in-memory cache --------------------
 const CACHE_TTL_MS = 6 * 60 * 60 * 1000; // 6 hours
-const cache = new Map(); // key: url::hint, value: { ts, data }
+const cache = new Map(); // key: url, value: { ts, data }
 
-function makeCacheKey(url, addressHint) {
-  return `${url}::hint=${(addressHint || "").trim()}`;
+function makeCacheKey(url) {
+  return String(url || "").trim();
 }
 
 function getCached(key) {
@@ -108,15 +108,12 @@ function normalizeAreaToFt2(areaStr) {
   const t = cleanText(areaStr);
   if (!t) return null;
 
-  // "912 sqft" -> "912 ft²"
   const mSqft = t.match(/([\d,]+)\s*sqft/i);
   if (mSqft) return `${mSqft[1]} ft²`;
 
-  // already "ft²"
   const mFt2 = t.match(/([\d,]+)\s*ft²/i);
   if (mFt2) return `${mFt2[1]} ft²`;
 
-  // contains both like "977 ft² (90.77 m²)" -> keep as-is
   if (/ft²/i.test(t) || /m²/i.test(t)) return t;
 
   return t;
@@ -129,24 +126,72 @@ function detectSource(url) {
   return "unknown";
 }
 
-async function withBrowser(fn) {
-  const browser = await chromium.launch({
-    headless: true,
-    args: ["--no-sandbox", "--disable-setuid-sandbox"],
-  });
+// -------------------- Playwright: shared browser + single-flight + resource blocking --------------------
+let sharedBrowser = null;
+let sharedBrowserLaunching = null;
 
-  const page = await browser.newPage({
-    userAgent:
-      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
-  });
-
-  try {
-    return await fn(page);
-  } finally {
-    await page.close().catch(() => {});
-    await browser.close().catch(() => {});
-  }
+// Only run one scrape at a time (prevents memory spikes on small Render instances)
+let scrapeLock = Promise.resolve();
+function runExclusive(fn) {
+  const next = scrapeLock.then(fn, fn);
+  scrapeLock = next.catch(() => {});
+  return next;
 }
+
+async function getBrowser() {
+  if (sharedBrowser) return sharedBrowser;
+  if (sharedBrowserLaunching) return sharedBrowserLaunching;
+
+  sharedBrowserLaunching = chromium.launch({
+    headless: true,
+    args: [
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+      "--disable-dev-shm-usage",
+      "--no-zygote",
+    ],
+  });
+
+  sharedBrowser = await sharedBrowserLaunching;
+  sharedBrowserLaunching = null;
+  return sharedBrowser;
+}
+
+async function withBrowser(fn) {
+  return runExclusive(async () => {
+    const browser = await getBrowser();
+
+    const context = await browser.newContext({
+      userAgent:
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
+    });
+
+    const page = await context.newPage();
+
+    // Block heavy resources (huge RAM + bandwidth savings)
+    await page.route("**/*", (route) => {
+      const type = route.request().resourceType();
+      if (type === "image" || type === "media" || type === "font") {
+        return route.abort();
+      }
+      return route.continue();
+    });
+
+    try {
+      return await fn(page);
+    } finally {
+      await page.close().catch(() => {});
+      await context.close().catch(() => {});
+    }
+  });
+}
+
+process.on("SIGTERM", async () => {
+  try {
+    if (sharedBrowser) await sharedBrowser.close();
+  } catch {}
+  process.exit(0);
+});
 
 // -------------------- Scraper: Centris --------------------
 async function scrapeCentris(url) {
@@ -154,7 +199,7 @@ async function scrapeCentris(url) {
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45000 });
 
     // Give JS time to paint the listing blocks
-    await page.waitForTimeout(700);
+    await page.waitForTimeout(650);
 
     // Best-effort: click Monthly toggle if present
     const clickedMonthly = await page.evaluate(() => {
@@ -166,11 +211,11 @@ async function scrapeCentris(url) {
       }
       return false;
     });
-    if (clickedMonthly) await page.waitForTimeout(650);
+    if (clickedMonthly) await page.waitForTimeout(550);
 
-    // ✅ Beds/Baths from .row.teaser innerText (confirmed on your Centris page)
+    // ✅ Beds/Baths from .row.teaser innerText (confirmed)
     await page.waitForSelector(".row.teaser", { timeout: 15000 }).catch(() => {});
-    await page.waitForTimeout(300);
+    await page.waitForTimeout(250);
 
     const { beds: bedsFromTeaser, baths: bathsFromTeaser } = await page.evaluate(() => {
       const el = document.querySelector(".row.teaser");
@@ -257,7 +302,7 @@ async function scrapeCentris(url) {
     }
     condoFees = ensureMonthlyFeesString(condoFees);
 
-    // Address (Centris can hide it; try a few places)
+    // Address (Centris can hide it)
     let address =
       cleanText($("[itemprop='address']").first().text()) ||
       cleanText($("h2[itemprop='address']").first().text()) ||
@@ -410,9 +455,19 @@ app.get("/api/listing", async (req, res) => {
 
   if (!url) return res.status(400).json({ ok: false, error: "Missing url parameter." });
 
-  const key = makeCacheKey(url, addressHint);
+  const key = makeCacheKey(url);
   const cached = getCached(key);
-  if (cached) return res.json({ ok: true, listing: cached, cached: true });
+  if (cached) {
+    // Ensure address is never blank even when cached
+    return res.json({
+      ok: true,
+      listing: {
+        ...cached,
+        address: cleanText(cached.address) || addressHint || "—",
+      },
+      cached: true,
+    });
+  }
 
   try {
     const src = detectSource(url);
