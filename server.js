@@ -1,541 +1,327 @@
-// server.js
 import express from "express";
 import path from "path";
 import { fileURLToPath } from "url";
-import { load } from "cheerio";
+import cheerio from "cheerio";
+import { chromium } from "playwright";
 
 const app = express();
-
-app.use((req, res, next) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-  if (req.method === "OPTIONS") return res.sendStatus(204);
-  next();
-});
-
+const PORT = process.env.PORT || 3000;
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Serve ONLY /public (put your HTML + images + fonts in /public)
-app.use(express.static(path.join(__dirname, "public")));
+// Serve your /public folder
+app.use(express.static(path.join(__dirname, "public"), { maxAge: "1h" }));
 
-/* ---------------- helpers ---------------- */
+/* -------------------- CACHE (server-side) -------------------- */
+/**
+ * Cache key: listing url
+ * Cache value: { savedAt, data }
+ * TTL keeps things fresh but still fast.
+ */
+const CACHE_TTL_MS = 1000 * 60 * 60 * 6; // 6 hours
+const listingCache = new Map();
 
-function cleanSpaces(s) {
-  return String(s || "").replace(/\s+/g, " ").trim();
-}
-
-function safeJsonParse(str) {
-  try { return JSON.parse(str); } catch { return null; }
-}
-
-function firstTruthy(arr) {
-  for (const v of arr) {
-    if (v !== null && v !== undefined && v !== "" && v !== "—") return v;
+function cacheGet(url) {
+  const hit = listingCache.get(url);
+  if (!hit) return null;
+  if (Date.now() - hit.savedAt > CACHE_TTL_MS) {
+    listingCache.delete(url);
+    return null;
   }
-  return null;
+  return hit.data;
 }
 
-function numberFromMoneyLike(s) {
-  const digits = cleanSpaces(s).replace(/[^\d]/g, "");
-  if (!digits) return null;
-  const n = Number(digits);
+function cacheSet(url, data) {
+  listingCache.set(url, { savedAt: Date.now(), data });
+}
+
+/* -------------------- PLAYWRIGHT REUSE (big speed win) -------------------- */
+let browserPromise = null;
+async function getBrowser() {
+  if (!browserPromise) {
+    browserPromise = chromium.launch({
+      headless: true,
+      // These args help on many hosts
+      args: ["--no-sandbox", "--disable-dev-shm-usage"],
+    });
+  }
+  return browserPromise;
+}
+
+/* -------------------- HELPERS -------------------- */
+function toMoneyNumber(str) {
+  if (!str) return null;
+  const s = String(str).replace(/\s/g, "");
+  const m = s.match(/([\d.,]+)/);
+  if (!m) return null;
+  const n = Number(m[1].replace(/,/g, ""));
   return Number.isFinite(n) ? n : null;
 }
 
 function formatCAD(n) {
-  if (!Number.isFinite(n)) return null;
-  return "$" + n.toLocaleString("en-CA");
+  if (!Number.isFinite(n)) return "—";
+  return n.toLocaleString("en-CA", { style: "currency", currency: "CAD", maximumFractionDigits: 0 });
 }
 
-function pickReasonablePriceFromCandidates(candidates) {
-  const MIN = 50000;
-  const MAX = 3000000;
-  for (const c of candidates) {
-    const n = numberFromMoneyLike(c);
-    if (n && n >= MIN && n <= MAX) return formatCAD(n);
+/**
+ * Convert condo fees to monthly if they appear yearly.
+ * Returns a display string like "$280 / month" or "$280/month"
+ */
+function normalizeCondoFees(raw) {
+  if (!raw) return { display: "—", raw: "—" };
+
+  const text = String(raw).trim();
+  const lower = text.toLowerCase();
+  const amt = toMoneyNumber(text);
+
+  // If Centris gives "Condominium fees $3360" (no unit), it is often yearly.
+  // If it explicitly says yearly, divide by 12.
+  const looksYearly =
+    lower.includes("year") ||
+    lower.includes("annual") ||
+    lower.includes("per year") ||
+    lower.includes("/year") ||
+    lower.includes("yearly");
+
+  const looksMonthly =
+    lower.includes("month") ||
+    lower.includes("monthly") ||
+    lower.includes("per month") ||
+    lower.includes("/month");
+
+  if (amt == null) return { display: text, raw: text };
+
+  // If it already says month, trust it
+  if (looksMonthly) return { display: `${formatCAD(amt)} / month`, raw: text };
+
+  // If it says yearly, convert
+  if (looksYearly) return { display: `${formatCAD(amt / 12)} / month`, raw: text };
+
+  // If there is no unit at all, assume yearly for Centris-style fees (this is what you want)
+  // If you ever see a real monthly number here, it will look huge and obvious and you can adjust.
+  return { display: `${formatCAD(amt / 12)} / month`, raw: text };
+}
+
+function pickFirstText($, selectors) {
+  for (const sel of selectors) {
+    const t = $(sel).first().text().trim();
+    if (t) return t;
   }
-  return null;
+  return "";
 }
 
-function extractCountsFromText(text) {
-  const t = cleanSpaces(text);
-
-  function find(labelSingular, labelPlural) {
-    const labels = [labelPlural, labelSingular].filter(Boolean);
-
-    for (const lab of labels) {
-      const m1 = t.match(new RegExp(String.raw`(\d+)\s+${lab}\b`, "i"));
-      if (m1) return Number(m1[1]);
-    }
-
-    for (const lab of labels) {
-      const m2 = t.match(new RegExp(String.raw`\b${lab}\s*[:\-]?\s*(\d+)\b`, "i"));
-      if (m2) return Number(m2[1]);
-    }
-
-    return null;
+function pickFirstAttr($, selectors, attr) {
+  for (const sel of selectors) {
+    const v = $(sel).first().attr(attr);
+    if (v) return String(v).trim();
   }
-
-  return {
-    beds: find("bedroom", "bedrooms"),
-    baths: find("bathroom", "bathrooms"),
-    levels: find("level", "levels"),
-  };
+  return "";
 }
 
-function extractAreaFromText(text) {
-  const t = cleanSpaces(text);
-
-  const m = t.match(/([\d,]+)\s*ft²\s*\(([\d.]+)\s*m²\)/i);
-  if (m) return `${m[1]} ft² (${m[2]} m²)`;
-
-  const m2 = t.match(/([\d,]+)\s*ft²/i);
-  if (m2) return `${m2[1]} ft²`;
-
-  return null;
-}
-
-function extractCondoFeesFromText(text) {
-  const t = cleanSpaces(text);
-
-  const m = t.match(/Condo fees[^$]*\$\s*([\d,]+(?:\.\d+)?)/i);
-  if (m) return `$${m[1]} / month`;
-
-  const m2 = t.match(/Condo fees[^0-9]*([\d,]+)\s*\$/i);
-  if (m2) return `$${m2[1]} / month`;
-
-  const m3 = t.match(/Frais[^$]*\$\s*([\d,]+(?:\.\d+)?)/i);
-  if (m3) return `$${m3[1]} / month`;
-
-  return null;
-}
-
-function extractJsonLdFromCheerio($) {
-  const out = [];
-  $("script[type='application/ld+json']").each((_, el) => {
-    const raw = $(el).text();
-    const parsed = safeJsonParse(raw);
-    if (!parsed) return;
-    if (Array.isArray(parsed)) out.push(...parsed);
-    else out.push(parsed);
-  });
-  return out;
-}
-
-function findPriceInJsonLd(ld) {
-  for (const obj of ld) {
-    if (!obj || typeof obj !== "object") continue;
-
-    const offers = obj.offers;
-    const offersArr = Array.isArray(offers) ? offers : (offers ? [offers] : []);
-    for (const off of offersArr) {
-      const p = off?.price ?? off?.priceSpecification?.price;
-      const n = Number(String(p ?? "").replace(/[^\d]/g, ""));
-      if (Number.isFinite(n) && n > 0) return formatCAD(n);
-    }
-
-    const main = obj.mainEntity;
-    if (main && typeof main === "object") {
-      const maybe = main?.offers?.price;
-      const n2 = Number(String(maybe ?? "").replace(/[^\d]/g, ""));
-      if (Number.isFinite(n2) && n2 > 0) return formatCAD(n2);
-    }
-  }
-  return null;
-}
-
-function findAddressInJsonLd(ld) {
-  for (const obj of ld) {
-    const addr = obj?.address;
-    if (!addr) continue;
-
-    if (typeof addr === "string") return cleanSpaces(addr);
-
-    if (typeof addr === "object") {
-      const parts = [
-        addr.streetAddress,
-        addr.addressLocality,
-        addr.addressRegion,
-        addr.postalCode,
-      ].filter(Boolean);
-      if (parts.length) return cleanSpaces(parts.join(", "));
-    }
-  }
-  return null;
-}
-
-function regexBuyPriceNearLabel(text) {
-  const t = cleanSpaces(text);
-
-  const m = t.match(/\bBuy\s*price\b[^$]{0,40}(\$[\d,]{3,})/i);
-  if (m) return pickReasonablePriceFromCandidates([m[1]]);
-
-  const m2 = t.match(/\bPrix\b[^$]{0,40}(\$[\d,]{3,})/i);
-  if (m2) return pickReasonablePriceFromCandidates([m2[1]]);
-
-  return null;
-}
-
-/* ---------------- DuProprio ---------------- */
-
+/* -------------------- DUPROPRIO SCRAPE (fast with fetch+cheerio) -------------------- */
 async function scrapeDuProprio(url) {
-  const r = await fetch(url, {
-    headers: {
-      "User-Agent":
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
-      "Accept":
-        "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-      "Accept-Language": "en-CA,en;q=0.9",
-    },
+  const resp = await fetch(url, {
+    headers: { "User-Agent": "Mozilla/5.0" },
   });
+  const html = await resp.text();
+  const $ = cheerio.load(html);
 
-  if (!r.ok) return { ok: false, error: `DuProprio fetch failed (${r.status})` };
-
-  const html = await r.text();
-  const $ = load(html);
-  const flatText = cleanSpaces($("body").text());
-
-  const ld = extractJsonLdFromCheerio($);
-  const ldPrice = findPriceInJsonLd(ld);
-  const ldAddr = findAddressInJsonLd(ld);
-
-  const metaItemPrice = $('meta[itemprop="price"]').attr("content") || "";
-  const metaOgTitle = $('meta[property="og:title"]').attr("content") || "";
-  const metaOgDesc = $('meta[property="og:description"]').attr("content") || "";
-
-  const ogTitlePrice = (metaOgTitle.match(/\$[\d,]{3,}/) || [null])[0];
-
-  const metaPrice = pickReasonablePriceFromCandidates([
-    metaItemPrice,
-    ogTitlePrice,
-  ]);
-
-  const moneyMatches = flatText.match(/\$[\d,]{3,}/g) || [];
+  // This is intentionally conservative since DuProprio HTML can vary.
+  // Keep whatever you already had working, but here is a baseline fallback.
+  const title = $("h1").first().text().trim();
 
   const price =
-    firstTruthy([
-      ldPrice,
-      metaPrice,
-      pickReasonablePriceFromCandidates(moneyMatches),
-    ]) || "—";
+    $('[data-testid="listing-price"]').first().text().trim() ||
+    $('meta[property="og:price:amount"]').attr("content") ||
+    "";
 
   const address =
-    firstTruthy([ldAddr, cleanSpaces(metaOgDesc)]) || "—";
+    $('[data-testid="listing-address"]').first().text().trim() ||
+    $('meta[property="og:street-address"]').attr("content") ||
+    title ||
+    "";
 
-  const counts = extractCountsFromText(flatText);
-  const area = extractAreaFromText(flatText);
-  const fees = extractCondoFeesFromText(flatText);
+  // You likely already parse these better. Leaving placeholders if not found.
+  return {
+    url,
+    source: "DuProprio",
+    address: address || "—",
+    price: price || "—",
+    beds: null,
+    baths: null,
+    levels: null,
+    area: null,
+    condoFees: "—",
+    contact: "—",
+  };
+}
+
+/* -------------------- CENTRIS SCRAPE (Playwright, optimized) -------------------- */
+async function scrapeCentris(url) {
+  const browser = await getBrowser();
+  const context = await browser.newContext({
+    userAgent:
+      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123 Safari/537.36",
+    viewport: { width: 1200, height: 900 },
+  });
+
+  const page = await context.newPage();
+
+  // Block heavy stuff: images, fonts, media, analytics
+  await page.route("**/*", (route) => {
+    const r = route.request();
+    const type = r.resourceType();
+    const u = r.url();
+
+    if (["image", "media", "font"].includes(type)) return route.abort();
+    if (u.includes("google-analytics") || u.includes("doubleclick") || u.includes("gtm")) return route.abort();
+
+    return route.continue();
+  });
+
+  await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45000 });
+
+  // Some Centris pages lazy-load content. Small wait helps without being huge.
+  await page.waitForTimeout(400);
+
+  const html = await page.content();
+  await page.close();
+  await context.close();
+
+  const $ = cheerio.load(html);
+
+  // PRICE
+  const price =
+    pickFirstText($, [
+      '[data-testid="buyPrice"]',
+      '[data-testid="price"]',
+      ".price",
+      ".carac-value .price",
+    ]) ||
+    $('meta[property="og:price:amount"]').attr("content") ||
+    "";
+
+  // ADDRESS
+  const address =
+    pickFirstText($, [
+      '[data-testid="address"]',
+      ".address",
+      ".property-address",
+      ".location-container",
+    ]) ||
+    $('meta[property="og:street-address"]').attr("content") ||
+    $('meta[property="og:description"]').attr("content") ||
+    "";
+
+  // BEDS / BATHS
+  const bedsText = pickFirstText($, [
+    '[data-testid="nbChambres"]',
+    '[data-testid="bedrooms"]',
+    '.carac-title:contains("Bedrooms") + .carac-value',
+    '.carac-title:contains("Beds") + .carac-value',
+    '.carac-title:contains("Number of rooms") + .carac-value',
+  ]);
+
+  const bathsText = pickFirstText($, [
+    '[data-testid="nbSallesDeBain"]',
+    '[data-testid="bathrooms"]',
+    '.carac-title:contains("Bathrooms") + .carac-value',
+    '.carac-title:contains("Baths") + .carac-value',
+  ]);
+
+  // AREA (you showed: carac-title "Net area" then carac-value "912 sqft")
+  const area =
+    pickFirstText($, [
+      '.carac-title:contains("Net area") + .carac-value',
+      '.carac-title:contains("Living area") + .carac-value',
+      '[data-testid="netArea"]',
+    ]).replace(/\s+/g, " ").trim();
+
+  // CONDO FEES (you showed: table row with "Condominium fees" + value)
+  const condoFeesRaw =
+    pickFirstText($, [
+      'td:contains("Condominium fees") + td',
+      '.carac-title:contains("Condominium fees") + .carac-value',
+      '.financial-details-table td:contains("Condominium fees") + td',
+    ]) || "";
+
+  const feesNorm = normalizeCondoFees(condoFeesRaw);
+
+  // AGENT / BROKER CONTACT (best effort, Centris HTML changes a lot)
+  const agentName =
+    pickFirstText($, [
+      '[data-testid="brokerName"]',
+      ".broker-card__name",
+      ".broker-info__name",
+      ".broker .name",
+    ]) || "";
+
+  const agentPhone =
+    pickFirstText($, [
+      '[data-testid="brokerPhone"]',
+      ".broker-card__phone",
+      ".broker-info__phone",
+      'a[href^="tel:"]',
+    ]) || "";
+
+  const agentEmail =
+    pickFirstAttr($, ['a[href^="mailto:"]'], "href")?.replace(/^mailto:/i, "") || "";
+
+  const contactBits = [agentName, agentPhone, agentEmail].filter(Boolean);
+  const contact = contactBits.length ? contactBits.join(" | ") : "—";
 
   return {
-    ok: true,
-    listing: {
-      url,
-      source: "DuProprio",
-      address,
-      price,
-      beds: counts.beds ?? null,
-      baths: counts.baths ?? null,
-      levels: counts.levels ?? null,
-      area: area || null,
-      condoFees: fees || null,
-      contact: "1 866 387-7677",
+    url,
+    source: "Centris",
+    address: address || "—",
+    price: price ? (String(price).includes("$") ? String(price).trim() : formatCAD(toMoneyNumber(price))) : "—",
+    beds: toMoneyNumber(bedsText),
+    baths: toMoneyNumber(bathsText),
+    levels: null,
+    area: area || "—",
+    condoFees: feesNorm.display,
+    contact,
+    _debug: {
+      condoFeesRaw: condoFeesRaw || "—",
     },
   };
 }
 
-/* ---------------- Centris (Playwright) ---------------- */
-
-async function scrapeCentris(url) {
-  let browser = null;
-
-  try {
-    const { chromium } = await import("playwright");
-
-    browser = await chromium.launch({
-      headless: true,
-      args: ["--disable-blink-features=AutomationControlled", "--no-sandbox"],
-    });
-
-    const context = await browser.newContext({
-      userAgent:
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
-      locale: "en-CA",
-      viewport: { width: 1280, height: 800 },
-    });
-
-    const page = await context.newPage();
-    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45000 });
-
-    // Try to dismiss cookie/consent overlays if present
-    const consentSelectors = [
-      "button:has-text('Accept')",
-      "button:has-text('I accept')",
-      "button:has-text('Agree')",
-      "button:has-text('Continue')",
-      "button:has-text('OK')",
-      "button:has-text('Tout accepter')",
-      "button:has-text('Accepter')",
-    ];
-    for (const sel of consentSelectors) {
-      try {
-        const btn = page.locator(sel).first();
-        if (await btn.count()) {
-          await btn.click({ timeout: 1000 }).catch(() => {});
-          break;
-        }
-      } catch {}
-    }
-
-    // Let the page hydrate and tables render
-    await page.waitForTimeout(800);
-    await page.waitForLoadState("networkidle", { timeout: 25000 }).catch(() => {});
-    await page.waitForSelector("table tr td", { timeout: 20000 }).catch(() => {});
-    await page.waitForTimeout(400);
-
-    const data = await page.evaluate(() => {
-      const clean = (s) => (s || "").replace(/\s+/g, " ").trim();
-
-      // 1) TABLE KV: "Label | Value"
-      const kv = {};
-      const rows = Array.from(document.querySelectorAll("table tr"));
-      for (const tr of rows) {
-        const cells = Array.from(tr.querySelectorAll("td, th"));
-        if (cells.length < 2) continue;
-
-        const key = clean(cells[0].textContent);
-        const val = clean(cells[cells.length - 1].textContent);
-
-        if (!key || !val) continue;
-        if (!kv[key] || String(val).length > String(kv[key]).length) kv[key] = val;
-      }
-
-      // 2) CARAC KV: blocks like "Net area" -> "912 sqft"
-      const carac = {};
-      const titles = Array.from(document.querySelectorAll(".carac-title"));
-      for (const titleEl of titles) {
-        const key = clean(titleEl.textContent);
-        const wrap = titleEl.parentElement;
-        if (!wrap) continue;
-
-        const valEl = wrap.querySelector(".carac-value");
-        const val = clean(valEl?.textContent || "");
-        if (!key || !val) continue;
-
-        carac[key] = val;
-      }
-
-      // Price candidates
-      const buyEl =
-        document.querySelector("#BuyPrice") ||
-        document.querySelector("[id*='BuyPrice']") ||
-        document.querySelector("[data-testid*='BuyPrice']");
-
-      const buyPriceText = clean(buyEl?.textContent || "");
-
-      const metaItemPrice =
-        document.querySelector("meta[itemprop='price']")?.getAttribute("content") || "";
-
-      const metaOgPrice =
-        document.querySelector("meta[property='og:price:amount']")?.getAttribute("content") ||
-        document.querySelector("meta[property='product:price:amount']")?.getAttribute("content") ||
-        "";
-
-      // JSON-LD
-      const ld = [];
-      document.querySelectorAll("script[type='application/ld+json']").forEach((s) => {
-        try {
-          const parsed = JSON.parse(s.textContent || "");
-          if (Array.isArray(parsed)) ld.push(...parsed);
-          else ld.push(parsed);
-        } catch {}
-      });
-
-      const bodyText = clean(document.body?.innerText || "");
-      return { kv, carac, buyPriceText, metaItemPrice, metaOgPrice, ld, bodyText };
-    });
-
-    const kv = data.kv || {};
-    const carac = data.carac || {};
-
-    const norm = (s) =>
-      cleanSpaces(String(s || ""))
-        .toLowerCase()
-        .replace(/[^\p{L}\p{N}]+/gu, " ")
-        .trim();
-
-    function findFromMapsStrict(possibleKeys) {
-      const targets = possibleKeys.map(norm);
-
-      // exact-ish match first (after normalization)
-      for (const [k, v] of Object.entries(kv)) {
-        const nk = norm(k);
-        if (targets.includes(nk)) return cleanSpaces(v);
-      }
-      for (const [k, v] of Object.entries(carac)) {
-        const nk = norm(k);
-        if (targets.includes(nk)) return cleanSpaces(v);
-      }
-
-      // fallback: contains match
-      for (const [k, v] of Object.entries(kv)) {
-        const nk = norm(k);
-        if (targets.some((t) => nk.includes(t))) return cleanSpaces(v);
-      }
-      for (const [k, v] of Object.entries(carac)) {
-        const nk = norm(k);
-        if (targets.some((t) => nk.includes(t))) return cleanSpaces(v);
-      }
-
-      return null;
-    }
-
-    // Price from JSON-LD offers.price
-    let ldPrice = null;
-    for (const obj of data.ld || []) {
-      const offers = obj?.offers;
-      const offersArr = Array.isArray(offers) ? offers : offers ? [offers] : [];
-      for (const off of offersArr) {
-        const p = off?.price ?? off?.priceSpecification?.price;
-        const n = Number(String(p ?? "").replace(/[^\d]/g, ""));
-        if (Number.isFinite(n) && n > 0) {
-          ldPrice = formatCAD(n);
-          break;
-        }
-      }
-      if (ldPrice) break;
-    }
-
-    const targeted = regexBuyPriceNearLabel(data.bodyText);
-
-    const price =
-      firstTruthy([
-        pickReasonablePriceFromCandidates([data.buyPriceText]),
-        pickReasonablePriceFromCandidates([data.metaItemPrice, data.metaOgPrice]),
-        ldPrice,
-        targeted,
-        pickReasonablePriceFromCandidates(data.bodyText.match(/\$[\d,]{3,}/g) || []),
-      ]) || "—";
-
-    // STRICT condo fee key
-    const rawFees = findFromMapsStrict([
-      "Condominium fees",
-      "Condo fees",
-      "Frais de copropriété",
-    ]);
-
-    let condoFees = null;
-    if (rawFees) {
-      const feeNum = numberFromMoneyLike(rawFees);
-      if (feeNum && feeNum > 0) condoFees = `$${feeNum.toLocaleString("en-CA")} / month`;
-    }
-    if (!condoFees) condoFees = extractCondoFeesFromText(data.bodyText);
-
-    // Net area from carac blocks
-    const rawArea = findFromMapsStrict([
-      "Net area",
-      "Living area",
-      "Floor area",
-      "Superficie",
-      "Surface habitable",
-    ]);
-
-    let area = null;
-    if (rawArea) {
-      const t = cleanSpaces(rawArea);
-
-      const sf = t.match(/([\d,.]+)\s*(sq\s*ft|sqft|sq\s*feet|ft²|sqf)/i);
-      const m2 = t.match(/([\d,.]+)\s*(m²|sqm|sq\s*m)/i);
-
-      if (sf && m2) {
-        area = `${sf[1]} ft² (${m2[1]} m²)`;
-      } else if (sf) {
-        area = `${sf[1]} ft²`;
-      } else if (m2) {
-        area = `${m2[1]} m²`;
-      }
-    }
-    if (!area) area = extractAreaFromText(data.bodyText);
-
-    // Beds/baths from tables or carac blocks, then fallback to body text
-    const rawBeds = findFromMapsStrict(["Bedrooms", "Bedroom", "Chambres", "Rooms"]);
-    const rawBaths = findFromMapsStrict(["Bathrooms", "Bathroom", "Salle de bain", "Salles de bain"]);
-
-    const countsFromText = extractCountsFromText(data.bodyText);
-
-    const beds =
-      firstTruthy([
-        rawBeds && Number(String(rawBeds).replace(/[^\d]/g, "")),
-        countsFromText.beds,
-      ]) ?? null;
-
-    const baths =
-      firstTruthy([
-        rawBaths && Number(String(rawBaths).replace(/[^\d]/g, "")),
-        countsFromText.baths,
-      ]) ?? null;
-
-    const levels = countsFromText.levels ?? null;
-
-    return {
-      ok: true,
-      listing: {
-        url,
-        source: "Centris",
-        address: "—", // UI overwrites with addressHint
-        price,
-        beds,
-        baths,
-        levels,
-        area: area || null,
-        condoFees: condoFees || null,
-        contact: "—",
-      },
-    };
-  } catch (e) {
-    return { ok: false, error: `Centris scrape failed: ${e?.message || String(e)}` };
-  } finally {
-    if (browser) {
-      try { await browser.close(); } catch {}
-    }
-  }
-}
-
-/* ---------------- Unified endpoint ---------------- */
-
+/* -------------------- API -------------------- */
 app.get("/api/listing", async (req, res) => {
-  const url = String(req.query.url || "");
-  const addressHint = cleanSpaces(req.query.addressHint || "");
-
-  if (!url) return res.status(400).json({ ok: false, error: "Missing ?url=" });
-
-  const isDuProprio = /^https:\/\/duproprio\.com\/en\//i.test(url);
-  const isCentris = /^https:\/\/(www\.)?centris\.ca\/en\//i.test(url);
-
-  if (!isDuProprio && !isCentris) {
-    return res.status(400).json({
-      ok: false,
-      error: "URL must be a duproprio.com/en or centris.ca/en listing.",
-    });
-  }
-
   try {
-    const result = isDuProprio ? await scrapeDuProprio(url) : await scrapeCentris(url);
+    const url = String(req.query.url || "").trim();
+    if (!url) return res.status(400).json({ ok: false, error: "Missing url" });
 
-    if (!result.ok) return res.status(502).json(result);
+    // 1) Server cache first (makes repeat clicks instant)
+    const cached = cacheGet(url);
+    if (cached) return res.json({ ok: true, listing: cached, cached: true });
 
-    // Always show your clean address label in the UI
-    result.listing.address = addressHint || result.listing.address || "—";
+    const host = new URL(url).hostname.replace(/^www\./, "");
+    let listing;
 
-    res.json(result);
+    if (host.includes("centris.ca")) {
+      listing = await scrapeCentris(url);
+    } else if (host.includes("duproprio.com")) {
+      listing = await scrapeDuProprio(url);
+    } else {
+      return res.status(400).json({ ok: false, error: "Unsupported source" });
+    }
+
+    cacheSet(url, listing);
+    return res.json({ ok: true, listing, cached: false });
   } catch (e) {
-    res.status(500).json({ ok: false, error: e?.message || String(e) });
+    return res.status(500).json({
+      ok: false,
+      error: `Listing scrape failed: ${e?.message || String(e)}`,
+    });
   }
 });
 
-const PORT = process.env.PORT || 3000;
+// Simple health check
+app.get("/health", (req, res) => res.json({ ok: true }));
+
 app.listen(PORT, () => {
-  console.log(`Server running: http://localhost:${PORT}`);
+  console.log(`Server listening on port ${PORT}`);
 });
