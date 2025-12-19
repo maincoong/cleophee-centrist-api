@@ -1,3 +1,7 @@
+// server.js (ESM)
+// npm i express playwright cheerio
+// npx playwright install chromium
+
 import express from "express";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -13,7 +17,7 @@ const __dirname = path.dirname(__filename);
 // -------------------- Static --------------------
 app.use(express.static(path.join(__dirname, "public")));
 
-// -------------------- Simple in-memory cache (fast) --------------------
+// -------------------- Simple in-memory cache --------------------
 const CACHE_TTL_MS = 6 * 60 * 60 * 1000; // 6 hours
 const cache = new Map(); // key: url, value: { ts, data }
 
@@ -43,7 +47,11 @@ function moneyToNumber(s) {
 
 function formatMoney(n) {
   if (!Number.isFinite(n)) return "—";
-  return n.toLocaleString("en-CA", { style: "currency", currency: "CAD", maximumFractionDigits: 0 });
+  return n.toLocaleString("en-CA", {
+    style: "currency",
+    currency: "CAD",
+    maximumFractionDigits: 0,
+  });
 }
 
 // If we ever accidentally get a yearly number, convert it safely.
@@ -51,23 +59,19 @@ function ensureMonthlyFeesString(raw) {
   const t = cleanText(raw);
   if (!t || t === "—") return "—";
 
-  // If already says month, keep it.
   if (/\/\s*month/i.test(t) || /\bmonthly\b/i.test(t)) return t;
 
-  // If says yearly or year, divide by 12.
   if (/\/\s*year/i.test(t) || /\byearly\b/i.test(t) || /\byear\b/i.test(t)) {
     const n = moneyToNumber(t);
     if (n != null) return `${formatMoney(Math.round(n / 12))} / month`;
     return t;
   }
 
-  // If it's just a number and it's huge, it is probably yearly.
   const n = moneyToNumber(t);
   if (n != null && n >= 1200) {
     return `${formatMoney(Math.round(n / 12))} / month`;
   }
 
-  // Otherwise leave it.
   return t;
 }
 
@@ -84,17 +88,19 @@ async function scrapeCentris(url) {
   });
 
   try {
-    // Load fast, but allow JS to run because the Monthly toggle changes the DOM.
+    // Let JS run, Centris renders content client-side.
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45000 });
 
-    // Give Centris a moment to render the important blocks.
-    await page.waitForTimeout(600);
+    // Wait for address if it appears (best-effort).
+    await page.waitForSelector("[itemprop='address']", { timeout: 8000 }).catch(() => {});
 
-    // Try to click the "Monthly" toggle inside the FEES panel (best effort).
-    // This is intentionally flexible because Centris markup can change.
+    // Small extra wait helps stabilize price/fees blocks.
+    await page.waitForTimeout(400);
+
+    // Try to click "Monthly" toggle (best effort).
     const clickedMonthly = await page.evaluate(() => {
-      const candidates = Array.from(document.querySelectorAll("button, a, div[role='button']"));
-      const monthly = candidates.find((el) => (el.textContent || "").trim().toLowerCase() === "monthly");
+      const els = Array.from(document.querySelectorAll("button, a, div[role='button']"));
+      const monthly = els.find((el) => (el.textContent || "").trim().toLowerCase() === "monthly");
       if (monthly) {
         monthly.click();
         return true;
@@ -102,31 +108,30 @@ async function scrapeCentris(url) {
       return false;
     });
 
-    if (clickedMonthly) {
-      // Wait a bit for the FEES numbers to update.
-      await page.waitForTimeout(700);
-    }
+    if (clickedMonthly) await page.waitForTimeout(650);
 
-    // Pull HTML after toggle.
     const html = await page.content();
     const $ = cheerio.load(html);
 
-    // Price: try a few common patterns
+    // ---------------- Price ----------------
     let price = "—";
-    const priceText = cleanText($("[data-cy='price']").text()) || cleanText($(".price, .carac-value .price").first().text());
+    const priceText =
+      cleanText($("[data-cy='price']").first().text()) ||
+      cleanText($(".price, .carac-value .price").first().text());
     if (priceText) {
       const m = priceText.match(/\$[\s0-9,]+/);
       if (m) price = cleanText(m[0]);
     }
 
-    // Beds / Baths / Area: use visible "carac" blocks
+    // ---------------- Caracs ----------------
     const getCarac = (label) => {
-      // Finds a title cell matching label, then pulls the nearest value
       const titles = $(".carac-title").toArray();
       for (const t of titles) {
         const tt = cleanText($(t).text()).toLowerCase();
         if (tt === label.toLowerCase()) {
-          const val = cleanText($(t).closest(".carac-container, .carac").find(".carac-value").first().text());
+          const val = cleanText(
+            $(t).closest(".carac-container, .carac").find(".carac-value").first().text()
+          );
           if (val) return val;
         }
       }
@@ -140,14 +145,12 @@ async function scrapeCentris(url) {
     const beds = moneyToNumber(bedsStr) ?? (bedsStr ? Number(bedsStr) : null);
     const baths = moneyToNumber(bathsStr) ?? (bathsStr ? Number(bathsStr) : null);
 
-    // Fees: after clicking Monthly, this should be something like "$280"
-    // We search for "Condominium fees" row in the FEES table.
+    // ---------------- Fees ----------------
     let condoFees = "—";
     const feeRows = $("table tr").toArray();
     for (const r of feeRows) {
       const rowText = cleanText($(r).text()).toLowerCase();
       if (rowText.includes("condominium fees")) {
-        // value is often in a right column like .text-right or last td
         const tds = $(r).find("td").toArray();
         if (tds.length) {
           const last = cleanText($(tds[tds.length - 1]).text());
@@ -156,29 +159,62 @@ async function scrapeCentris(url) {
       }
     }
 
-    // If we got a plain "$280", normalize to "$280 / month"
     if (condoFees !== "—") {
       const n = moneyToNumber(condoFees);
       if (n != null) condoFees = `${formatMoney(n)} / month`;
     }
     condoFees = ensureMonthlyFeesString(condoFees);
 
-    // Address: Centris sometimes hides it; try common blocks
-    let address = cleanText($("[data-cy='address']").text());
-    if (!address) address = cleanText($("h1").first().text());
+    // ---------------- Address (FIX) ----------------
+    let address = "";
 
-    // Agent contact: best effort (name + phone if present)
+    // 1) Centris DOM (matches your screenshot)
+    address =
+      cleanText($("[itemprop='address']").first().text()) ||
+      cleanText($("h2[itemprop='address']").first().text()) ||
+      cleanText($("[data-cy='address']").first().text());
+
+    // 2) Fallback: OG title
+    if (!address) {
+      const ogTitle = cleanText($("meta[property='og:title']").attr("content"));
+      if (ogTitle) address = ogTitle;
+    }
+
+    // 3) Fallback: JSON-LD
+    if (!address) {
+      const scripts = $("script[type='application/ld+json']").toArray();
+      for (const s of scripts) {
+        try {
+          const json = JSON.parse($(s).text());
+          const items = Array.isArray(json) ? json : [json];
+
+          for (const it of items) {
+            const addr =
+              it?.address?.streetAddress ||
+              it?.address?.name ||
+              it?.location?.address?.streetAddress;
+
+            if (addr) {
+              address = cleanText(addr);
+              break;
+            }
+          }
+        } catch {
+          // ignore
+        }
+        if (address) break;
+      }
+    }
+
+    // ---------------- Contact ----------------
     let contact = "—";
     const agentName =
       cleanText($("[data-cy='broker-name']").text()) ||
       cleanText($(".broker-name, .brokerName, .realtor-name").first().text());
     const phone =
-      cleanText($("[data-cy='broker-phone']").text()) ||
-      cleanText($("a[href^='tel:']").first().text());
+      cleanText($("[data-cy='broker-phone']").text()) || cleanText($("a[href^='tel:']").first().text());
 
-    if (agentName || phone) {
-      contact = cleanText([agentName, phone].filter(Boolean).join(" - "));
-    }
+    if (agentName || phone) contact = cleanText([agentName, phone].filter(Boolean).join(" - "));
 
     return {
       url,
@@ -199,8 +235,7 @@ async function scrapeCentris(url) {
 }
 
 async function scrapeDuProprio(url) {
-  // If you already have a working DuProprio scraper, keep yours.
-  // This is a placeholder that returns minimal fields so your UI does not break.
+  // Keep your own working DuProprio scraper if you have one.
   return {
     url,
     source: "DuProprio",
@@ -227,11 +262,9 @@ app.get("/api/listing", async (req, res) => {
   const url = String(req.query.url || "").trim();
   if (!url) return res.status(400).json({ ok: false, error: "Missing url parameter." });
 
-  // 1) server cache = instant on second click (even if user refreshes page)
+  // cache
   const cached = getCached(url);
-  if (cached) {
-    return res.json({ ok: true, listing: cached, cached: true });
-  }
+  if (cached) return res.json({ ok: true, listing: cached, cached: true });
 
   try {
     const src = detectSource(url);
@@ -241,9 +274,7 @@ app.get("/api/listing", async (req, res) => {
     else if (src === "duproprio") listing = await scrapeDuProprio(url);
     else return res.status(400).json({ ok: false, error: "Unknown listing source." });
 
-    // 2) cache it
     setCached(url, listing);
-
     return res.json({ ok: true, listing, cached: false });
   } catch (e) {
     return res.status(500).json({ ok: false, error: `Scrape failed: ${e?.message || e}` });
