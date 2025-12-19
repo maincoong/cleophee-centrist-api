@@ -40,10 +40,10 @@ app.options("*", (req, res) => {
 
 // -------------------- Simple in-memory cache --------------------
 const CACHE_TTL_MS = 6 * 60 * 60 * 1000; // 6 hours
-const cache = new Map(); // key: url, value: { ts, data }
+const cache = new Map(); // key: url::hint, value: { ts, data }
 
-function makeCacheKey(url) {
-  return String(url || "").trim();
+function makeCacheKey(url, addressHint) {
+  return `${url}::hint=${(addressHint || "").trim()}`;
 }
 
 function getCached(key) {
@@ -108,12 +108,15 @@ function normalizeAreaToFt2(areaStr) {
   const t = cleanText(areaStr);
   if (!t) return null;
 
+  // "912 sqft" -> "912 ft²"
   const mSqft = t.match(/([\d,]+)\s*sqft/i);
   if (mSqft) return `${mSqft[1]} ft²`;
 
+  // already "ft²"
   const mFt2 = t.match(/([\d,]+)\s*ft²/i);
   if (mFt2) return `${mFt2[1]} ft²`;
 
+  // contains both like "977 ft² (90.77 m²)" -> keep as-is
   if (/ft²/i.test(t) || /m²/i.test(t)) return t;
 
   return t;
@@ -126,72 +129,24 @@ function detectSource(url) {
   return "unknown";
 }
 
-// -------------------- Playwright: shared browser + single-flight + resource blocking --------------------
-let sharedBrowser = null;
-let sharedBrowserLaunching = null;
-
-// Only run one scrape at a time (prevents memory spikes on small Render instances)
-let scrapeLock = Promise.resolve();
-function runExclusive(fn) {
-  const next = scrapeLock.then(fn, fn);
-  scrapeLock = next.catch(() => {});
-  return next;
-}
-
-async function getBrowser() {
-  if (sharedBrowser) return sharedBrowser;
-  if (sharedBrowserLaunching) return sharedBrowserLaunching;
-
-  sharedBrowserLaunching = chromium.launch({
-    headless: true,
-    args: [
-      "--no-sandbox",
-      "--disable-setuid-sandbox",
-      "--disable-dev-shm-usage",
-      "--no-zygote",
-    ],
-  });
-
-  sharedBrowser = await sharedBrowserLaunching;
-  sharedBrowserLaunching = null;
-  return sharedBrowser;
-}
-
 async function withBrowser(fn) {
-  return runExclusive(async () => {
-    const browser = await getBrowser();
-
-    const context = await browser.newContext({
-      userAgent:
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
-    });
-
-    const page = await context.newPage();
-
-    // Block heavy resources (huge RAM + bandwidth savings)
-    await page.route("**/*", (route) => {
-      const type = route.request().resourceType();
-      if (type === "image" || type === "media" || type === "font") {
-        return route.abort();
-      }
-      return route.continue();
-    });
-
-    try {
-      return await fn(page);
-    } finally {
-      await page.close().catch(() => {});
-      await context.close().catch(() => {});
-    }
+  const browser = await chromium.launch({
+    headless: true,
+    args: ["--no-sandbox", "--disable-setuid-sandbox"],
   });
-}
 
-process.on("SIGTERM", async () => {
+  const page = await browser.newPage({
+    userAgent:
+      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
+  });
+
   try {
-    if (sharedBrowser) await sharedBrowser.close();
-  } catch {}
-  process.exit(0);
-});
+    return await fn(page);
+  } finally {
+    await page.close().catch(() => {});
+    await browser.close().catch(() => {});
+  }
+}
 
 // -------------------- Scraper: Centris --------------------
 async function scrapeCentris(url) {
@@ -199,7 +154,7 @@ async function scrapeCentris(url) {
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45000 });
 
     // Give JS time to paint the listing blocks
-    await page.waitForTimeout(650);
+    await page.waitForTimeout(700);
 
     // Best-effort: click Monthly toggle if present
     const clickedMonthly = await page.evaluate(() => {
@@ -211,35 +166,36 @@ async function scrapeCentris(url) {
       }
       return false;
     });
-    if (clickedMonthly) await page.waitForTimeout(550);
+    if (clickedMonthly) await page.waitForTimeout(650);
 
-    // ✅ Beds/Baths from .row.teaser innerText (confirmed)
-    await page.waitForSelector(".row.teaser", { timeout: 15000 }).catch(() => {});
-    await page.waitForTimeout(250);
+    // Beds/Baths from teaser blocks (.cac = bedrooms, .sdb = bathrooms)
+    const counts = await page.evaluate(() => {
+      function readText(sel) {
+        const el = document.querySelector(sel);
+        if (!el) return "";
+        return (el.textContent || "").trim();
+      }
 
-    const { beds: bedsFromTeaser, baths: bathsFromTeaser } = await page.evaluate(() => {
-      const el = document.querySelector(".row.teaser");
-      const txt = (el?.innerText || "")
-        .replace(/\u00a0/g, " ")
-        .replace(/\s+/g, " ")
-        .trim()
-        .toLowerCase();
+      const rowText = document.querySelector(".row.teaser")?.innerText || "";
+      const bedsText = readText(".row.teaser .cac") || rowText;
+      const bathsText = readText(".row.teaser .sdb") || rowText;
 
-      const pick = (re) => {
-        const m = txt.match(re);
-        if (!m) return null;
-        const n = Number(m[1]);
-        return Number.isFinite(n) ? n : null;
-      };
-
-      const beds = pick(/(\d+)\s*(bedrooms?|beds?|chambres?|chambre)\b/);
-      const baths = pick(/(\d+)\s*(bathrooms?|baths?|bath|salle(?:s)?\s*de\s*bain)\b/);
-
-      return { beds, baths };
+      return { bedsText, bathsText, rowText };
     });
 
-    let beds = bedsFromTeaser;
-    let baths = bathsFromTeaser;
+    let beds = null;
+    let baths = null;
+
+    // Strong parse from the teaser row text (works even if .cac/.sdb text is weird)
+    if (counts?.rowText) {
+      const bedMatch = counts.rowText.match(/(\d+)\s*bedroom/i);
+      const bathMatch = counts.rowText.match(/(\d+)\s*bathroom/i);
+      if (bedMatch) beds = Number(bedMatch[1]);
+      if (bathMatch) baths = Number(bathMatch[1]);
+    }
+
+    if (beds == null) beds = parseCountFromText(counts?.bedsText);
+    if (baths == null) baths = parseCountFromText(counts?.bathsText);
 
     const html = await page.content();
     const $ = load(html);
@@ -302,7 +258,7 @@ async function scrapeCentris(url) {
     }
     condoFees = ensureMonthlyFeesString(condoFees);
 
-    // Address (Centris can hide it)
+    // Address
     let address =
       cleanText($("[itemprop='address']").first().text()) ||
       cleanText($("h2[itemprop='address']").first().text()) ||
@@ -338,13 +294,96 @@ async function scrapeCentris(url) {
   });
 }
 
+// -------------------- DuProprio address extractor (FIX) --------------------
+function extractDuProprioAddress($) {
+  // 1) Best: structured data (JSON-LD)
+  const scripts = $("script[type='application/ld+json']").toArray();
+  for (const s of scripts) {
+    const raw = $(s).text();
+    if (!raw) continue;
+
+    let data;
+    try {
+      data = JSON.parse(raw);
+    } catch {
+      continue;
+    }
+
+    const nodes = Array.isArray(data) ? data : [data];
+    for (const node of nodes) {
+      const addr = node?.address || node?.offers?.address;
+      const street =
+        addr?.streetAddress ||
+        node?.streetAddress ||
+        node?.location?.address?.streetAddress ||
+        null;
+
+      const locality =
+        addr?.addressLocality ||
+        node?.addressLocality ||
+        node?.location?.address?.addressLocality ||
+        "";
+
+      const region =
+        addr?.addressRegion ||
+        node?.addressRegion ||
+        node?.location?.address?.addressRegion ||
+        "";
+
+      const postal = addr?.postalCode || "";
+
+      if (street) {
+        const parts = [street, locality, region, postal].map(cleanText).filter(Boolean);
+        return parts.join(", ");
+      }
+    }
+  }
+
+  // 2) Next: meta description often contains the address (your screenshot)
+  const desc = cleanText($("meta[name='description']").attr("content"));
+  if (desc) {
+    // Try to capture things like: "406-3100 rue Guillaume-Lahaise"
+    const m =
+      desc.match(/(\d{1,6}(?:-\d{1,6})?\s+rue\s+[A-Za-zÀ-ÿ0-9'’\- ]+)/i) ||
+      desc.match(/(\d{1,6}(?:-\d{1,6})?\s+[^,]+?\s+(?:street|st\.|avenue|ave\.|road|rd\.|boulevard|blvd\.|rue)\s+[A-Za-zÀ-ÿ0-9'’\- ]+)/i);
+
+    if (m && m[1]) {
+      // Add city if it appears later in the description
+      const cityMatch = desc.match(/\b(Montréal|Montreal)\b/i);
+      const city = cityMatch ? "Montréal" : "";
+      return cleanText([m[1], city].filter(Boolean).join(", "));
+    }
+  }
+
+  // 3) Fallback: og:street-address if present
+  const ogStreet = cleanText($("meta[property='og:street-address']").attr("content"));
+  if (ogStreet) return ogStreet;
+
+  // 4) Last resort: og:title / h1, but filter out marketing copy
+  let t =
+    cleanText($("meta[property='og:title']").attr("content")) ||
+    cleanText($("h1").first().text());
+
+  if (t) {
+    // If it looks like marketing, reject it
+    if (/take a look|condominium for sale|commission-free/i.test(t)) {
+      return "";
+    }
+    // Strip site suffixes
+    t = t.replace(/\s*-\s*DuProprio.*$/i, "").trim();
+    return t;
+  }
+
+  return "";
+}
+
 // -------------------- Scraper: DuProprio --------------------
 async function scrapeDuProprio(url) {
   return withBrowser(async (page) => {
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45000 });
     await page.waitForTimeout(900);
 
-    // ✅ Pull the exact DOM blocks you showed
+    // Pull DOM counts (your selector strategy)
     const domCounts = await page.evaluate(() => {
       function findNumberByIcon(iconClass) {
         const icon = document.querySelector(iconClass);
@@ -367,7 +406,8 @@ async function scrapeDuProprio(url) {
       const bathsText = findNumberByIcon(".listing-main-characteristics__icon--bathrooms");
 
       const dimEl =
-        document.querySelector(".listing-main-characteristics__icon--living-space-area")
+        document
+          .querySelector(".listing-main-characteristics__icon--living-space-area")
           ?.closest(".listing-main-characteristics__item")
           ?.querySelector(".listing-main-characteristics__number") || null;
 
@@ -395,16 +435,8 @@ async function scrapeDuProprio(url) {
       if (m) price = cleanText(m[0]);
     }
 
-    // Address
-    let address =
-      cleanText($("meta[property='og:street-address']").attr("content")) ||
-      cleanText($("meta[property='og:title']").attr("content")) ||
-      cleanText($("h1").first().text());
-
-    if (address && /duproprio/i.test(address)) {
-      address = address.replace(/\s*-\s*DuProprio.*$/i, "").trim();
-      address = address.replace(/^.*?\-\s*/i, "").trim();
-    }
+    // ✅ FIXED Address
+    const address = extractDuProprioAddress($);
 
     // Beds/Baths from DOM
     const beds = parseCountFromText(domCounts?.bedsText);
@@ -455,19 +487,9 @@ app.get("/api/listing", async (req, res) => {
 
   if (!url) return res.status(400).json({ ok: false, error: "Missing url parameter." });
 
-  const key = makeCacheKey(url);
+  const key = makeCacheKey(url, addressHint);
   const cached = getCached(key);
-  if (cached) {
-    // Ensure address is never blank even when cached
-    return res.json({
-      ok: true,
-      listing: {
-        ...cached,
-        address: cleanText(cached.address) || addressHint || "—",
-      },
-      cached: true,
-    });
-  }
+  if (cached) return res.json({ ok: true, listing: cached, cached: true });
 
   try {
     const src = detectSource(url);
@@ -477,7 +499,7 @@ app.get("/api/listing", async (req, res) => {
     else if (src === "duproprio") listing = await scrapeDuProprio(url);
     else return res.status(400).json({ ok: false, error: "Unknown listing source." });
 
-    // Address must never be blank (fallback to building's hard-coded address)
+    // Address must never be blank
     const finalListing = {
       ...listing,
       address: cleanText(listing.address) || addressHint || "—",
