@@ -1,19 +1,3 @@
-app.use((req, res, next) => {
-  res.setHeader("Access-Control-Allow-Origin", "https://joeymakesweb.com");
-  res.setHeader("Access-Control-Allow-Methods", "GET,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-  next();
-});
-
-// handle preflight
-app.options("*", (req, res) => {
-  res.setHeader("Access-Control-Allow-Origin", "https://joeymakesweb.com");
-  res.setHeader("Access-Control-Allow-Methods", "GET,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-  res.sendStatus(204);
-});
-
-
 // server.js (ESM)
 // npm i express playwright cheerio
 // npx playwright install chromium
@@ -22,13 +6,34 @@ import express from "express";
 import path from "path";
 import { fileURLToPath } from "url";
 import { chromium } from "playwright";
-import { load } from "cheerio"; // ✅ FIX: no default import in ESM
+import { load } from "cheerio"; // ✅ ESM-safe Cheerio import (no default)
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
+// -------------------- CORS (must be BEFORE routes) --------------------
+// Allow ONLY your site to call this API from the browser.
+const ALLOWED_ORIGIN = "https://joeymakesweb.com";
+
+app.use((req, res, next) => {
+  res.setHeader("Access-Control-Allow-Origin", ALLOWED_ORIGIN);
+  res.setHeader("Vary", "Origin");
+  res.setHeader("Access-Control-Allow-Methods", "GET,OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  next();
+});
+
+// Handle preflight requests
+app.options("*", (req, res) => {
+  res.setHeader("Access-Control-Allow-Origin", ALLOWED_ORIGIN);
+  res.setHeader("Vary", "Origin");
+  res.setHeader("Access-Control-Allow-Methods", "GET,OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  res.sendStatus(204);
+});
 
 // -------------------- Static --------------------
 app.use(express.static(path.join(__dirname, "public")));
@@ -124,7 +129,7 @@ async function scrapeCentris(url) {
     if (clickedMonthly) await page.waitForTimeout(650);
 
     const html = await page.content();
-    const $ = load(html); // ✅ FIX: cheerio load
+    const $ = load(html);
 
     // ---------------- Price ----------------
     let price = "—";
@@ -225,7 +230,7 @@ async function scrapeCentris(url) {
     return {
       url,
       source: "Centris",
-      address: address || "", // API will enforce fallback
+      address: address || "", // API enforces fallback below
       price,
       beds: Number.isFinite(beds) ? beds : null,
       baths: Number.isFinite(baths) ? baths : null,
@@ -241,6 +246,7 @@ async function scrapeCentris(url) {
 }
 
 async function scrapeDuProprio(url) {
+  // Keep your own working DuProprio scraper if you have one.
   return {
     url,
     source: "DuProprio",
@@ -265,7 +271,7 @@ function detectSource(url) {
 // -------------------- API --------------------
 app.get("/api/listing", async (req, res) => {
   const url = String(req.query.url || "").trim();
-  const addressHint = String(req.query.addressHint || "").trim(); // ✅ fallback from your building dataset
+  const addressHint = String(req.query.addressHint || "").trim(); // ✅ from your SVG building dataset
 
   if (!url) return res.status(400).json({ ok: false, error: "Missing url parameter." });
 
@@ -281,7 +287,7 @@ app.get("/api/listing", async (req, res) => {
     else if (src === "duproprio") listing = await scrapeDuProprio(url);
     else return res.status(400).json({ ok: false, error: "Unknown listing source." });
 
-    // ✅ enforce address never blank
+    // ✅ address can never be blank
     const finalListing = {
       ...listing,
       address: cleanText(listing.address) || addressHint || "—",
