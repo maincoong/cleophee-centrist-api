@@ -1,3 +1,19 @@
+app.use((req, res, next) => {
+  res.setHeader("Access-Control-Allow-Origin", "https://joeymakesweb.com");
+  res.setHeader("Access-Control-Allow-Methods", "GET,OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  next();
+});
+
+// handle preflight
+app.options("*", (req, res) => {
+  res.setHeader("Access-Control-Allow-Origin", "https://joeymakesweb.com");
+  res.setHeader("Access-Control-Allow-Methods", "GET,OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  res.sendStatus(204);
+});
+
+
 // server.js (ESM)
 // npm i express playwright cheerio
 // npx playwright install chromium
