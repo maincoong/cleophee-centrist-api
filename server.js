@@ -3,43 +3,49 @@
 // npx playwright install chromium
 
 import express from "express";
-import path from "path";
-import { fileURLToPath } from "url";
 import { chromium } from "playwright";
 import { load } from "cheerio";
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-
 // -------------------- CORS --------------------
-const ALLOWED_ORIGIN = "https://joeymakesweb.com";
+const ALLOWED_ORIGINS = new Set([
+  "https://joeymakesweb.com",
+  "http://localhost:3000",
+  "http://127.0.0.1:3000",
+]);
 
 app.use((req, res, next) => {
-  res.setHeader("Access-Control-Allow-Origin", ALLOWED_ORIGIN);
-  res.setHeader("Vary", "Origin");
+  const origin = req.headers.origin;
+  if (origin && ALLOWED_ORIGINS.has(origin)) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Vary", "Origin");
+  }
   res.setHeader("Access-Control-Allow-Methods", "GET,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
   next();
 });
 
 app.options("*", (req, res) => {
-  res.setHeader("Access-Control-Allow-Origin", ALLOWED_ORIGIN);
-  res.setHeader("Vary", "Origin");
+  const origin = req.headers.origin;
+  if (origin && ALLOWED_ORIGINS.has(origin)) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Vary", "Origin");
+  }
   res.setHeader("Access-Control-Allow-Methods", "GET,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
   res.sendStatus(204);
 });
 
-// -------------------- Cache --------------------
+// -------------------- Simple in-memory cache --------------------
 const CACHE_TTL_MS = 6 * 60 * 60 * 1000; // 6 hours
-const cache = new Map(); // key: url::hint => {ts,data}
+const cache = new Map(); // key: url::hint, value: { ts, data }
 
 function makeCacheKey(url, addressHint) {
   return `${url}::hint=${(addressHint || "").trim()}`;
 }
+
 function getCached(key) {
   const hit = cache.get(key);
   if (!hit) return null;
@@ -49,6 +55,7 @@ function getCached(key) {
   }
   return hit.data;
 }
+
 function setCached(key, data) {
   cache.set(key, { ts: Date.now(), data });
 }
@@ -57,11 +64,13 @@ function setCached(key, data) {
 function cleanText(s) {
   return (s || "").replace(/\s+/g, " ").trim();
 }
+
 function moneyToNumber(s) {
   const n = Number(String(s || "").replace(/[^0-9.]/g, ""));
   return Number.isFinite(n) ? n : null;
 }
-function formatMoneyCAD(n) {
+
+function formatMoney(n) {
   if (!Number.isFinite(n)) return "—";
   return n.toLocaleString("en-CA", {
     style: "currency",
@@ -69,6 +78,7 @@ function formatMoneyCAD(n) {
     maximumFractionDigits: 0,
   });
 }
+
 function ensureMonthlyFeesString(raw) {
   const t = cleanText(raw);
   if (!t || t === "—") return "—";
@@ -77,12 +87,37 @@ function ensureMonthlyFeesString(raw) {
 
   if (/\/\s*year/i.test(t) || /\byearly\b/i.test(t) || /\byear\b/i.test(t)) {
     const n = moneyToNumber(t);
-    if (n != null) return `${formatMoneyCAD(Math.round(n / 12))} / month`;
+    if (n != null) return `${formatMoney(Math.round(n / 12))} / month`;
     return t;
   }
 
   const n = moneyToNumber(t);
-  if (n != null && n >= 1200) return `${formatMoneyCAD(Math.round(n / 12))} / month`;
+  if (n != null && n >= 1200) return `${formatMoney(Math.round(n / 12))} / month`;
+
+  return t;
+}
+
+function parseCountFromText(s) {
+  const m = String(s || "").match(/(\d+(?:\.\d+)?)/);
+  if (!m) return null;
+  const n = Number(m[1]);
+  return Number.isFinite(n) ? n : null;
+}
+
+function normalizeAreaToFt2(areaStr) {
+  const t = cleanText(areaStr);
+  if (!t) return null;
+
+  // "912 sqft" -> "912 ft²"
+  const mSqft = t.match(/([\d,]+)\s*sqft/i);
+  if (mSqft) return `${mSqft[1]} ft²`;
+
+  // already "ft²"
+  const mFt2 = t.match(/([\d,]+)\s*ft²/i);
+  if (mFt2) return `${mFt2[1]} ft²`;
+
+  // contains both like "977 ft² (90.77 m²)" -> keep as-is
+  if (/ft²/i.test(t) || /m²/i.test(t)) return t;
 
   return t;
 }
@@ -94,7 +129,6 @@ function detectSource(url) {
   return "unknown";
 }
 
-// -------------------- Shared browser helper --------------------
 async function withBrowser(fn) {
   const browser = await chromium.launch({
     headless: true,
@@ -114,14 +148,15 @@ async function withBrowser(fn) {
   }
 }
 
-// -------------------- Scrape: Centris --------------------
+// -------------------- Scraper: Centris --------------------
 async function scrapeCentris(url) {
   return withBrowser(async (page) => {
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45000 });
-    await page.waitForSelector("[itemprop='address']", { timeout: 8000 }).catch(() => {});
-    await page.waitForTimeout(400);
 
-    // Best-effort monthly toggle
+    // Give JS time to paint the listing blocks
+    await page.waitForTimeout(700);
+
+    // Best-effort: click Monthly toggle if present
     const clickedMonthly = await page.evaluate(() => {
       const els = Array.from(document.querySelectorAll("button, a, div[role='button']"));
       const monthly = els.find((el) => (el.textContent || "").trim().toLowerCase() === "monthly");
@@ -132,6 +167,27 @@ async function scrapeCentris(url) {
       return false;
     });
     if (clickedMonthly) await page.waitForTimeout(650);
+
+    // ✅ Beds/Baths from CSS ::before (your screenshot)
+    const counts = await page.evaluate(() => {
+      function readPseudoOrText(sel) {
+        const el = document.querySelector(sel);
+        if (!el) return "";
+        const pseudo = getComputedStyle(el, "::before")?.content || "";
+        const pseudoClean = pseudo.replace(/^"|"$/g, "").trim();
+        const text = (el.textContent || "").trim();
+        return pseudoClean || text || "";
+      }
+
+      // Centris uses these teaser blocks on many listings
+      const bedsText = readPseudoOrText(".row.teaser .cac");
+      const bathsText = readPseudoOrText(".row.teaser .sdb");
+
+      return { bedsText, bathsText };
+    });
+
+    let beds = parseCountFromText(counts?.bedsText);
+    let baths = parseCountFromText(counts?.bathsText);
 
     const html = await page.content();
     const $ = load(html);
@@ -146,7 +202,7 @@ async function scrapeCentris(url) {
       if (m) price = cleanText(m[0]);
     }
 
-    // Caracs
+    // Caracs grid fallback (some pages have actual labels)
     const getCarac = (label) => {
       const titles = $(".carac-title").toArray();
       for (const t of titles) {
@@ -161,14 +217,21 @@ async function scrapeCentris(url) {
       return "";
     };
 
-    const bedsStr = getCarac("Number of rooms") || getCarac("Bedrooms") || getCarac("Beds");
-    const bathsStr = getCarac("Number of bathrooms") || getCarac("Bathrooms") || getCarac("Baths");
-    const areaStr = getCarac("Net area") || getCarac("Area");
+    // Fallback beds/baths if teaser missing
+    if (beds == null) {
+      const b = getCarac("Bedrooms") || getCarac("Beds") || getCarac("Number of rooms");
+      beds = parseCountFromText(b);
+    }
+    if (baths == null) {
+      const b = getCarac("Bathrooms") || getCarac("Baths") || getCarac("Number of bathrooms");
+      baths = parseCountFromText(b);
+    }
 
-    const beds = moneyToNumber(bedsStr) ?? (bedsStr ? Number(bedsStr) : null);
-    const baths = moneyToNumber(bathsStr) ?? (bathsStr ? Number(bathsStr) : null);
+    // Area
+    const rawArea = getCarac("Net area") || getCarac("Area");
+    const area = rawArea ? normalizeAreaToFt2(rawArea) : null;
 
-    // Fees
+    // Condo fees
     let condoFees = "—";
     const feeRows = $("table tr").toArray();
     for (const r of feeRows) {
@@ -183,7 +246,7 @@ async function scrapeCentris(url) {
     }
     if (condoFees !== "—") {
       const n = moneyToNumber(condoFees);
-      if (n != null) condoFees = `${formatMoneyCAD(n)} / month`;
+      if (n != null) condoFees = `${formatMoney(n)} / month`;
     }
     condoFees = ensureMonthlyFeesString(condoFees);
 
@@ -198,7 +261,7 @@ async function scrapeCentris(url) {
       if (ogTitle) address = ogTitle;
     }
 
-    // Contact
+    // Contact (best effort)
     let contact = "—";
     const agentName =
       cleanText($("[data-cy='broker-name']").text()) ||
@@ -216,112 +279,108 @@ async function scrapeCentris(url) {
       beds: Number.isFinite(beds) ? beds : null,
       baths: Number.isFinite(baths) ? baths : null,
       levels: null,
-      area: areaStr ? cleanText(areaStr) : null,
+      area,
       condoFees,
       contact,
     };
   });
 }
 
-// -------------------- Scrape: DuProprio --------------------
+// -------------------- Scraper: DuProprio --------------------
 async function scrapeDuProprio(url) {
   return withBrowser(async (page) => {
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45000 });
-    await page.waitForTimeout(500);
+    await page.waitForTimeout(900);
+
+    // ✅ Pull the exact DOM blocks you showed
+    const domCounts = await page.evaluate(() => {
+      function findNumberByIcon(iconClass) {
+        const icon = document.querySelector(iconClass);
+        if (!icon) return null;
+
+        // The structure shown has a label wrapper nearby. We'll climb to closest item.
+        const item =
+          icon.closest(".listing-main-characteristics__item") ||
+          icon.closest("[class*='listing-main-characteristics__item']") ||
+          icon.parentElement;
+
+        if (!item) return null;
+
+        const num =
+          item.querySelector(".listing-main-characteristics__number") ||
+          item.querySelector("[class*='listing-main-characteristics__number']");
+        return num ? (num.textContent || "").trim() : null;
+      }
+
+      const bedsText = findNumberByIcon(".listing-main-characteristics__icon--bedrooms");
+      const bathsText = findNumberByIcon(".listing-main-characteristics__icon--bathrooms");
+
+      const dimEl =
+        document.querySelector(".listing-main-characteristics__icon--living-space-area")
+          ?.closest(".listing-main-characteristics__item")
+          ?.querySelector(".listing-main-characteristics__number") || null;
+
+      const areaText = dimEl ? (dimEl.textContent || "").trim() : null;
+
+      return { bedsText, bathsText, areaText };
+    });
 
     const html = await page.content();
     const $ = load(html);
 
-    // Address: DuProprio often has it in og:title or h1
+    // Price (meta is most reliable)
+    let price = "—";
+    const metaAmount =
+      cleanText($("meta[property='product:price:amount']").attr("content")) ||
+      cleanText($("meta[property='og:price:amount']").attr("content")) ||
+      cleanText($("meta[name='twitter:data1']").attr("content"));
+    if (metaAmount) {
+      const n = moneyToNumber(metaAmount);
+      if (n != null) price = formatMoney(n);
+    }
+    if (price === "—") {
+      const t = cleanText($("body").text());
+      const m = t.match(/\$[\s0-9,]+/);
+      if (m) price = cleanText(m[0]);
+    }
+
+    // Address
     let address =
-      cleanText($("[data-testid='listing-address']").first().text()) ||
+      cleanText($("meta[property='og:street-address']").attr("content")) ||
+      cleanText($("meta[property='og:title']").attr("content")) ||
       cleanText($("h1").first().text());
 
-    if (!address) {
-      const ogTitle = cleanText($("meta[property='og:title']").attr("content"));
-      if (ogTitle) address = ogTitle;
+    if (address && /duproprio/i.test(address)) {
+      address = address.replace(/\s*-\s*DuProprio.*$/i, "").trim();
+      address = address.replace(/^.*?\-\s*/i, "").trim();
     }
 
-    // Price: try common patterns, then fallback to any $xxx,xxx in prominent text
-    let price = "—";
-    const priceCandidates = [
-      $("[data-testid='listing-price']").first().text(),
-      $("[data-testid='price']").first().text(),
-      $(".price").first().text(),
-      $("meta[property='product:price:amount']").attr("content"),
-      $("meta[property='og:price:amount']").attr("content"),
-    ]
-      .map(cleanText)
-      .filter(Boolean);
+    // Beds/Baths from DOM
+    const beds = parseCountFromText(domCounts?.bedsText);
+    const baths = parseCountFromText(domCounts?.bathsText);
 
-    let priceText = priceCandidates[0] || "";
-    if (!priceText) {
-      const bigText = cleanText($("body").text());
-      const m = bigText.match(/\$[\s0-9]{1,3}(?:,[0-9]{3})+/);
-      if (m) priceText = m[0];
+    // Area from DOM
+    const area = domCounts?.areaText ? normalizeAreaToFt2(domCounts.areaText) : null;
+
+    // Fees (best effort)
+    const bodyText = cleanText($("body").text());
+    let condoFees = "—";
+    const feesMatch =
+      bodyText.match(/\$[\s0-9,]+\s*\/\s*(?:month|mo)\b/i) ||
+      bodyText.match(/Condo(?:minium)?\s*fees?.{0,30}(\$[\s0-9,]+)/i) ||
+      bodyText.match(/Fees?.{0,30}(\$[\s0-9,]+)/i);
+
+    if (feesMatch) {
+      condoFees = cleanText(feesMatch[0]);
+      const n = moneyToNumber(condoFees);
+      if (n != null && !/\/\s*(month|mo)\b/i.test(condoFees)) condoFees = `${formatMoney(n)} / month`;
     }
-
-    if (priceText) {
-      if (/^\d+$/.test(priceText)) price = formatMoneyCAD(Number(priceText));
-      else {
-        const m = priceText.match(/\$[\s0-9,]+/);
-        if (m) price = cleanText(m[0]);
-      }
-    }
-
-    // Helper: find a "label: value" row anywhere
-    function findValueByLabel(labels) {
-      const allTextNodes = $("body").find("*").toArray();
-      const wanted = labels.map((l) => l.toLowerCase());
-
-      for (const el of allTextNodes) {
-        const t = cleanText($(el).text());
-        if (!t || t.length > 120) continue;
-
-        const low = t.toLowerCase();
-        for (const w of wanted) {
-          if (low === w) {
-            // Try next sibling
-            const sib = cleanText($(el).next().text());
-            if (sib) return sib;
-
-            // Try parent row
-            const parent = $(el).parent();
-            const maybe = cleanText(parent.find("*").last().text());
-            if (maybe && maybe.toLowerCase() !== w) return maybe;
-          }
-        }
-      }
-      return "";
-    }
-
-    // Beds / Baths
-    const bedsStr =
-      findValueByLabel(["Bedrooms", "Beds", "Chambres"]) ||
-      cleanText($("[data-testid='bedrooms']").first().text());
-
-    const bathsStr =
-      findValueByLabel(["Bathrooms", "Baths", "Salles de bain"]) ||
-      cleanText($("[data-testid='bathrooms']").first().text());
-
-    const beds = moneyToNumber(bedsStr) ?? (bedsStr ? Number(bedsStr) : null);
-    const baths = moneyToNumber(bathsStr) ?? (bathsStr ? Number(bathsStr) : null);
-
-    // Area
-    const areaStr =
-      findValueByLabel(["Area", "Net area", "Superficie"]) ||
-      cleanText($("[data-testid='area']").first().text());
-
-    // Condo fees
-    let condoFees =
-      findValueByLabel(["Condo fees", "Condominium fees", "Frais de condo", "Frais de copropriété"]) ||
-      cleanText($("[data-testid='condo-fees']").first().text());
-
-    condoFees = cleanText(condoFees) || "—";
     condoFees = ensureMonthlyFeesString(condoFees);
 
-    // Contact: DuProprio often does not expose a person, so leave as dash
-    const contact = "—";
+    // Contact (best effort)
+    let contact = "—";
+    const tel = cleanText($("a[href^='tel:']").first().text());
+    if (tel) contact = tel;
 
     return {
       url,
@@ -331,7 +390,7 @@ async function scrapeDuProprio(url) {
       beds: Number.isFinite(beds) ? beds : null,
       baths: Number.isFinite(baths) ? baths : null,
       levels: null,
-      area: areaStr ? cleanText(areaStr) : null,
+      area,
       condoFees,
       contact,
     };
@@ -357,7 +416,7 @@ app.get("/api/listing", async (req, res) => {
     else if (src === "duproprio") listing = await scrapeDuProprio(url);
     else return res.status(400).json({ ok: false, error: "Unknown listing source." });
 
-    // Enforce: address must never be blank
+    // Address must never be blank
     const finalListing = {
       ...listing,
       address: cleanText(listing.address) || addressHint || "—",
@@ -370,7 +429,7 @@ app.get("/api/listing", async (req, res) => {
   }
 });
 
-// Health / homepage
+// -------------------- Root (API-only) --------------------
 app.get("/", (req, res) => {
   res.type("text").send("OK");
 });
