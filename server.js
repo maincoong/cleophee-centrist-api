@@ -45,7 +45,6 @@ const cache = new Map(); // key: url::hint, value: { ts, data }
 function makeCacheKey(url, addressHint) {
   return `${url}::hint=${(addressHint || "").trim()}`;
 }
-
 function getCached(key) {
   const hit = cache.get(key);
   if (!hit) return null;
@@ -55,7 +54,6 @@ function getCached(key) {
   }
   return hit.data;
 }
-
 function setCached(key, data) {
   cache.set(key, { ts: Date.now(), data });
 }
@@ -116,7 +114,7 @@ function normalizeAreaToFt2(areaStr) {
   const mFt2 = t.match(/([\d,]+)\s*ft²/i);
   if (mFt2) return `${mFt2[1]} ft²`;
 
-  // contains both like "977 ft² (90.77 m²)" -> keep as-is
+  // if it contains both like "977 ft² (90.77 m²)" keep as-is
   if (/ft²/i.test(t) || /m²/i.test(t)) return t;
 
   return t;
@@ -127,6 +125,36 @@ function detectSource(url) {
   if (u.includes("centris.ca")) return "centris";
   if (u.includes("duproprio.com")) return "duproprio";
   return "unknown";
+}
+
+// -------------------- Address validation --------------------
+function looksLikeRealAddress(s) {
+  const t = cleanText(s);
+  if (!t) return false;
+
+  if (/[!?]/.test(t)) return false;
+
+  const sentenceDots = (t.match(/\./g) || []).length;
+  if (sentenceDots >= 2) return false;
+
+  if (!/\d/.test(t)) return false;
+
+  const streetWord =
+    /\b(rue|av(?:enue)?|boulevard|boul|chemin|ch|route|rang|place|allee|allée|impasse|cote|côte|street|st|road|rd|avenue|ave|boulevard|blvd|drive|dr|lane|ln|court|ct|way)\b/i;
+
+  if (!streetWord.test(t)) return false;
+
+  const words = t.split(/\s+/).filter(Boolean);
+  if (words.length > 18) return false;
+
+  if (/\b(take a look|discover|invites you|for sale|commission[- ]?free)\b/i.test(t)) return false;
+
+  return true;
+}
+
+function sanitizeAddressOrBlank(s) {
+  const t = cleanText(s);
+  return looksLikeRealAddress(t) ? t : "";
 }
 
 async function withBrowser(fn) {
@@ -152,41 +180,16 @@ async function withBrowser(fn) {
 async function scrapeCentris(url) {
   return withBrowser(async (page) => {
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45000 });
-
-    // Give JS time to paint the listing blocks
     await page.waitForTimeout(700);
 
-    // Best-effort: click Monthly toggle if present
-    const clickedMonthly = await page.evaluate(() => {
-      const els = Array.from(document.querySelectorAll("button, a, div[role='button']"));
-      const monthly = els.find((el) => (el.textContent || "").trim().toLowerCase() === "monthly");
-      if (monthly) {
-        monthly.click();
-        return true;
-      }
-      return false;
-    });
-    if (clickedMonthly) await page.waitForTimeout(650);
-
-    // Beds/Baths from teaser blocks (.cac = bedrooms, .sdb = bathrooms)
     const counts = await page.evaluate(() => {
-      function readText(sel) {
-        const el = document.querySelector(sel);
-        if (!el) return "";
-        return (el.textContent || "").trim();
-      }
-
       const rowText = document.querySelector(".row.teaser")?.innerText || "";
-      const bedsText = readText(".row.teaser .cac") || rowText;
-      const bathsText = readText(".row.teaser .sdb") || rowText;
-
-      return { bedsText, bathsText, rowText };
+      return { rowText };
     });
 
     let beds = null;
     let baths = null;
 
-    // Strong parse from the teaser row text (works even if .cac/.sdb text is weird)
     if (counts?.rowText) {
       const bedMatch = counts.rowText.match(/(\d+)\s*bedroom/i);
       const bathMatch = counts.rowText.match(/(\d+)\s*bathroom/i);
@@ -194,13 +197,9 @@ async function scrapeCentris(url) {
       if (bathMatch) baths = Number(bathMatch[1]);
     }
 
-    if (beds == null) beds = parseCountFromText(counts?.bedsText);
-    if (baths == null) baths = parseCountFromText(counts?.bathsText);
-
     const html = await page.content();
     const $ = load(html);
 
-    // Price
     let price = "—";
     const priceText =
       cleanText($("[data-cy='price']").first().text()) ||
@@ -210,7 +209,6 @@ async function scrapeCentris(url) {
       if (m) price = cleanText(m[0]);
     }
 
-    // Caracs grid fallback (some pages have actual labels)
     const getCarac = (label) => {
       const titles = $(".carac-title").toArray();
       for (const t of titles) {
@@ -225,21 +223,9 @@ async function scrapeCentris(url) {
       return "";
     };
 
-    // Fallback beds/baths if teaser missing
-    if (beds == null) {
-      const b = getCarac("Bedrooms") || getCarac("Beds") || getCarac("Number of rooms");
-      beds = parseCountFromText(b);
-    }
-    if (baths == null) {
-      const b = getCarac("Bathrooms") || getCarac("Baths") || getCarac("Number of bathrooms");
-      baths = parseCountFromText(b);
-    }
-
-    // Area
     const rawArea = getCarac("Net area") || getCarac("Area");
     const area = rawArea ? normalizeAreaToFt2(rawArea) : null;
 
-    // Condo fees
     let condoFees = "—";
     const feeRows = $("table tr").toArray();
     for (const r of feeRows) {
@@ -258,18 +244,11 @@ async function scrapeCentris(url) {
     }
     condoFees = ensureMonthlyFeesString(condoFees);
 
-    // Address
     let address =
       cleanText($("[itemprop='address']").first().text()) ||
       cleanText($("h2[itemprop='address']").first().text()) ||
       cleanText($("[data-cy='address']").first().text());
 
-    if (!address) {
-      const ogTitle = cleanText($("meta[property='og:title']").attr("content"));
-      if (ogTitle) address = ogTitle;
-    }
-
-    // Contact (best effort)
     let contact = "—";
     const agentName =
       cleanText($("[data-cy='broker-name']").text()) ||
@@ -294,9 +273,9 @@ async function scrapeCentris(url) {
   });
 }
 
-// -------------------- DuProprio address extractor (FIX) --------------------
+// -------------------- DuProprio address extraction --------------------
 function extractDuProprioAddress($) {
-  // 1) Best: structured data (JSON-LD)
+  // JSON-LD first
   const scripts = $("script[type='application/ld+json']").toArray();
   for (const s of scripts) {
     const raw = $(s).text();
@@ -311,68 +290,35 @@ function extractDuProprioAddress($) {
 
     const nodes = Array.isArray(data) ? data : [data];
     for (const node of nodes) {
-      const addr = node?.address || node?.offers?.address;
-      const street =
-        addr?.streetAddress ||
-        node?.streetAddress ||
-        node?.location?.address?.streetAddress ||
-        null;
-
-      const locality =
-        addr?.addressLocality ||
-        node?.addressLocality ||
-        node?.location?.address?.addressLocality ||
-        "";
-
-      const region =
-        addr?.addressRegion ||
-        node?.addressRegion ||
-        node?.location?.address?.addressRegion ||
-        "";
-
+      const addr = node?.address || node?.location?.address || null;
+      const street = addr?.streetAddress || null;
+      const locality = addr?.addressLocality || "";
+      const region = addr?.addressRegion || "";
       const postal = addr?.postalCode || "";
 
       if (street) {
         const parts = [street, locality, region, postal].map(cleanText).filter(Boolean);
-        return parts.join(", ");
+        const out = parts.join(", ");
+        if (looksLikeRealAddress(out)) return out;
       }
     }
   }
 
-  // 2) Next: meta description often contains the address (your screenshot)
+  // meta description often includes street
   const desc = cleanText($("meta[name='description']").attr("content"));
   if (desc) {
-    // Try to capture things like: "406-3100 rue Guillaume-Lahaise"
-    const m =
-      desc.match(/(\d{1,6}(?:-\d{1,6})?\s+rue\s+[A-Za-zÀ-ÿ0-9'’\- ]+)/i) ||
-      desc.match(/(\d{1,6}(?:-\d{1,6})?\s+[^,]+?\s+(?:street|st\.|avenue|ave\.|road|rd\.|boulevard|blvd\.|rue)\s+[A-Za-zÀ-ÿ0-9'’\- ]+)/i);
-
-    if (m && m[1]) {
-      // Add city if it appears later in the description
-      const cityMatch = desc.match(/\b(Montréal|Montreal)\b/i);
-      const city = cityMatch ? "Montréal" : "";
-      return cleanText([m[1], city].filter(Boolean).join(", "));
+    const dash = "[\\-\\u2010\\u2011\\u2012\\u2013\\u2014\\u2015]";
+    const re = new RegExp(`\\b\\d{1,6}(?:${dash}\\d{1,6})?\\s*rue\\s*[^.,]+`, "i");
+    const m = desc.match(re);
+    if (m && m[0]) {
+      const candidate = cleanText(m[0]) + (/\b(Montréal|Montreal)\b/i.test(desc) ? ", Montréal" : "");
+      if (looksLikeRealAddress(candidate)) return candidate;
+      if (looksLikeRealAddress(cleanText(m[0]))) return cleanText(m[0]);
     }
   }
 
-  // 3) Fallback: og:street-address if present
   const ogStreet = cleanText($("meta[property='og:street-address']").attr("content"));
-  if (ogStreet) return ogStreet;
-
-  // 4) Last resort: og:title / h1, but filter out marketing copy
-  let t =
-    cleanText($("meta[property='og:title']").attr("content")) ||
-    cleanText($("h1").first().text());
-
-  if (t) {
-    // If it looks like marketing, reject it
-    if (/take a look|condominium for sale|commission-free/i.test(t)) {
-      return "";
-    }
-    // Strip site suffixes
-    t = t.replace(/\s*-\s*DuProprio.*$/i, "").trim();
-    return t;
-  }
+  if (ogStreet && looksLikeRealAddress(ogStreet)) return ogStreet;
 
   return "";
 }
@@ -383,8 +329,10 @@ async function scrapeDuProprio(url) {
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45000 });
     await page.waitForTimeout(900);
 
-    // Pull DOM counts (your selector strategy)
-    const domCounts = await page.evaluate(() => {
+    // ✅ Beds/Baths from your DOM icons
+    // ✅ Living space from the exact element you showed:
+    // span.listing-main-characteristics__number.listing-main-characteristics__number--dimensions
+    const dom = await page.evaluate(() => {
       function findNumberByIcon(iconClass) {
         const icon = document.querySelector(iconClass);
         if (!icon) return null;
@@ -405,15 +353,13 @@ async function scrapeDuProprio(url) {
       const bedsText = findNumberByIcon(".listing-main-characteristics__icon--bedrooms");
       const bathsText = findNumberByIcon(".listing-main-characteristics__icon--bathrooms");
 
-      const dimEl =
-        document
-          .querySelector(".listing-main-characteristics__icon--living-space-area")
-          ?.closest(".listing-main-characteristics__item")
-          ?.querySelector(".listing-main-characteristics__number") || null;
+      // Living space / dimensions
+      const dim =
+        document.querySelector(
+          "span.listing-main-characteristics__number.listing-main-characteristics__number--dimensions"
+        )?.textContent || "";
 
-      const areaText = dimEl ? (dimEl.textContent || "").trim() : null;
-
-      return { bedsText, bathsText, areaText };
+      return { bedsText, bathsText, dimText: (dim || "").trim() };
     });
 
     const html = await page.content();
@@ -435,15 +381,13 @@ async function scrapeDuProprio(url) {
       if (m) price = cleanText(m[0]);
     }
 
-    // ✅ FIXED Address
     const address = extractDuProprioAddress($);
 
-    // Beds/Baths from DOM
-    const beds = parseCountFromText(domCounts?.bedsText);
-    const baths = parseCountFromText(domCounts?.bathsText);
+    const beds = parseCountFromText(dom?.bedsText);
+    const baths = parseCountFromText(dom?.bathsText);
 
-    // Area from DOM
-    const area = domCounts?.areaText ? normalizeAreaToFt2(domCounts.areaText) : null;
+    // Living space: normalize (keeps "977 ft² (90.77 m²)" as-is)
+    const area = dom?.dimText ? normalizeAreaToFt2(dom.dimText) : null;
 
     // Fees (best effort)
     const bodyText = cleanText($("body").text());
@@ -460,7 +404,6 @@ async function scrapeDuProprio(url) {
     }
     condoFees = ensureMonthlyFeesString(condoFees);
 
-    // Contact (best effort)
     let contact = "—";
     const tel = cleanText($("a[href^='tel:']").first().text());
     if (tel) contact = tel;
@@ -499,11 +442,10 @@ app.get("/api/listing", async (req, res) => {
     else if (src === "duproprio") listing = await scrapeDuProprio(url);
     else return res.status(400).json({ ok: false, error: "Unknown listing source." });
 
-    // Address must never be blank
-    const finalListing = {
-      ...listing,
-      address: cleanText(listing.address) || addressHint || "—",
-    };
+    const safeScraped = sanitizeAddressOrBlank(listing.address);
+    const finalAddress = safeScraped || cleanText(addressHint) || "—";
+
+    const finalListing = { ...listing, address: finalAddress };
 
     setCached(key, finalListing);
     return res.json({ ok: true, listing: finalListing, cached: false });
