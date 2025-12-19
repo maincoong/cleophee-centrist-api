@@ -168,26 +168,33 @@ async function scrapeCentris(url) {
     });
     if (clickedMonthly) await page.waitForTimeout(650);
 
-    // ✅ Beds/Baths from CSS ::before (your screenshot)
-    const counts = await page.evaluate(() => {
-      function readPseudoOrText(sel) {
-        const el = document.querySelector(sel);
-        if (!el) return "";
-        const pseudo = getComputedStyle(el, "::before")?.content || "";
-        const pseudoClean = pseudo.replace(/^"|"$/g, "").trim();
-        const text = (el.textContent || "").trim();
-        return pseudoClean || text || "";
-      }
+    // ✅ Beds/Baths from .row.teaser innerText (confirmed on your Centris page)
+    await page.waitForSelector(".row.teaser", { timeout: 15000 }).catch(() => {});
+    await page.waitForTimeout(300);
 
-      // Centris uses these teaser blocks on many listings
-      const bedsText = readPseudoOrText(".row.teaser .cac");
-      const bathsText = readPseudoOrText(".row.teaser .sdb");
+    const { beds: bedsFromTeaser, baths: bathsFromTeaser } = await page.evaluate(() => {
+      const el = document.querySelector(".row.teaser");
+      const txt = (el?.innerText || "")
+        .replace(/\u00a0/g, " ")
+        .replace(/\s+/g, " ")
+        .trim()
+        .toLowerCase();
 
-      return { bedsText, bathsText };
+      const pick = (re) => {
+        const m = txt.match(re);
+        if (!m) return null;
+        const n = Number(m[1]);
+        return Number.isFinite(n) ? n : null;
+      };
+
+      const beds = pick(/(\d+)\s*(bedrooms?|beds?|chambres?|chambre)\b/);
+      const baths = pick(/(\d+)\s*(bathrooms?|baths?|bath|salle(?:s)?\s*de\s*bain)\b/);
+
+      return { beds, baths };
     });
 
-    let beds = parseCountFromText(counts?.bedsText);
-    let baths = parseCountFromText(counts?.bathsText);
+    let beds = bedsFromTeaser;
+    let baths = bathsFromTeaser;
 
     const html = await page.content();
     const $ = load(html);
@@ -250,7 +257,7 @@ async function scrapeCentris(url) {
     }
     condoFees = ensureMonthlyFeesString(condoFees);
 
-    // Address
+    // Address (Centris can hide it; try a few places)
     let address =
       cleanText($("[itemprop='address']").first().text()) ||
       cleanText($("h2[itemprop='address']").first().text()) ||
@@ -298,7 +305,6 @@ async function scrapeDuProprio(url) {
         const icon = document.querySelector(iconClass);
         if (!icon) return null;
 
-        // The structure shown has a label wrapper nearby. We'll climb to closest item.
         const item =
           icon.closest(".listing-main-characteristics__item") ||
           icon.closest("[class*='listing-main-characteristics__item']") ||
@@ -416,7 +422,7 @@ app.get("/api/listing", async (req, res) => {
     else if (src === "duproprio") listing = await scrapeDuProprio(url);
     else return res.status(400).json({ ok: false, error: "Unknown listing source." });
 
-    // Address must never be blank
+    // Address must never be blank (fallback to building's hard-coded address)
     const finalListing = {
       ...listing,
       address: cleanText(listing.address) || addressHint || "—",
