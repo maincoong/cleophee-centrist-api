@@ -10,6 +10,7 @@
   },
   "dependencies": {
     "cheerio": "^1.1.2",
+    "compression": "^1.8.1",
     "cookie-parser": "^1.4.7",
     "express": "^4.22.1",
     "googleapis": "^140.0.1",
