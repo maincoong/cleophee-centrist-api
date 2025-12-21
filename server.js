@@ -258,51 +258,83 @@ async function enableFastRoutes(page) {
   });
 }
 
-// Retry wrapper for the exact failure you are seeing
+// -------------------- Playwright safety helpers --------------------
 function isExecutionContextDestroyed(err) {
   const msg = String(err?.message || err || "");
   return msg.includes("Execution context was destroyed") || msg.includes("because of a navigation");
 }
 
-async function safeEvaluate(page, fn, { timeoutMs = 5500, retries = 2, label = "eval" } = {}) {
+async function safeEvaluate(page, fn, { timeoutMs = 6500, retries = 2, label = "eval" } = {}) {
   let lastErr;
   for (let i = 0; i <= retries; i += 1) {
     try {
-      // tiny settle helps when sites do an immediate redirect or hydration nav
       await page.waitForTimeout(120);
       return await withHardTimeout(page.evaluate(fn), timeoutMs, `${label} timeout`);
     } catch (e) {
       lastErr = e;
       if (!isExecutionContextDestroyed(e)) throw e;
       if (i === retries) break;
-      // wait a bit and try again on the new document context
-      await page.waitForTimeout(250);
+      await page.waitForTimeout(300);
     }
   }
   throw lastErr;
 }
 
+async function gotoWithRetries(page, url, opts = {}) {
+  const { navTimeoutMs = 25000, tries = 2, waitUntil = "domcontentloaded" } = opts;
+  let lastErr;
+
+  for (let attempt = 0; attempt <= tries; attempt += 1) {
+    try {
+      await withHardTimeout(page.goto(url, { waitUntil }), navTimeoutMs, "nav timeout");
+      return;
+    } catch (e) {
+      lastErr = e;
+
+      const msg = String(e?.message || e || "");
+      const isTimeout = msg.toLowerCase().includes("timeout");
+      if (!isTimeout) throw e;
+
+      try {
+        await page.waitForTimeout(300);
+        await page.evaluate(() => (window.stop ? window.stop() : null)).catch(() => {});
+      } catch {}
+
+      if (attempt < tries) {
+        await page.waitForTimeout(600);
+        try {
+          await withHardTimeout(page.goto(url, { waitUntil: "commit" }), navTimeoutMs, "nav timeout");
+          return;
+        } catch (e2) {
+          lastErr = e2;
+        }
+      }
+    }
+  }
+
+  throw lastErr;
+}
+
+// -------------------- Playwright fetchers --------------------
 async function fetchHtmlPlaywright(url, { expectSelector } = {}) {
   await ensureBrowser();
   const page = await context.newPage();
 
-  page.setDefaultNavigationTimeout(12000);
-  page.setDefaultTimeout(12000);
+  page.setDefaultNavigationTimeout(30000);
+  page.setDefaultTimeout(30000);
 
   await enableFastRoutes(page);
 
   try {
-    await withHardTimeout(page.goto(url, { waitUntil: "domcontentloaded" }), 12000, "nav timeout");
+    await gotoWithRetries(page, url, { navTimeoutMs: 25000, tries: 2, waitUntil: "domcontentloaded" });
 
-    // If we know something that should exist, wait briefly for it.
     if (expectSelector) {
-      await page.waitForSelector(expectSelector, { timeout: 4000 }).catch(() => {});
+      await page.waitForSelector(expectSelector, { timeout: 6000 }).catch(() => {});
     } else {
-      // brief settle
-      await page.waitForTimeout(180);
+      await page.waitForTimeout(250);
     }
 
-    const html = await withHardTimeout(page.content(), 6500, "content timeout");
+    const html = await withHardTimeout(page.content(), 9000, "content timeout");
     return html;
   } finally {
     await page.close().catch(() => {});
@@ -314,16 +346,15 @@ async function fetchDuProprioStructuredPlaywright(url) {
   await ensureBrowser();
   const page = await context.newPage();
 
-  page.setDefaultNavigationTimeout(12000);
-  page.setDefaultTimeout(12000);
+  page.setDefaultNavigationTimeout(30000);
+  page.setDefaultTimeout(30000);
 
   await enableFastRoutes(page);
 
   try {
-    await withHardTimeout(page.goto(url, { waitUntil: "domcontentloaded" }), 12000, "nav timeout");
+    await gotoWithRetries(page, url, { navTimeoutMs: 25000, tries: 2, waitUntil: "domcontentloaded" });
 
-    // If JSON-LD exists, give it a moment to appear.
-    await page.waitForSelector("script[type='application/ld+json']", { timeout: 3500 }).catch(() => {});
+    await page.waitForSelector("script[type='application/ld+json']", { timeout: 6000 }).catch(() => {});
 
     const data = await safeEvaluate(
       page,
@@ -341,7 +372,6 @@ async function fetchDuProprioStructuredPlaywright(url) {
           .map((s) => s.textContent || "")
           .filter(Boolean);
 
-        // Some pages also expose a usable title
         const ogTitle = getMeta("meta[property='og:title']") || "";
         const ogDesc = getMeta("meta[property='og:description']") || "";
 
@@ -357,7 +387,7 @@ async function fetchDuProprioStructuredPlaywright(url) {
           ),
         };
       },
-      { timeoutMs: 6000, retries: 2, label: "dp structured eval" }
+      { timeoutMs: 7000, retries: 2, label: "dp structured eval" }
     );
 
     return data;
@@ -409,9 +439,7 @@ function parseCentrisFromHtml(url, html) {
     for (const t of titles) {
       const tt = cleanText($(t).text()).toLowerCase();
       if (tt === label.toLowerCase()) {
-        const val = cleanText(
-          $(t).closest(".carac-container, .carac").find(".carac-value").first().text()
-        );
+        const val = cleanText($(t).closest(".carac-container, .carac").find(".carac-value").first().text());
         if (val) return val;
       }
     }
@@ -440,16 +468,14 @@ function parseCentrisFromHtml(url, html) {
   condoFees = ensureMonthlyFeesString(condoFees);
 
   let address =
-    cleanText($("[itemprop='address']").first().text()) ||
-    cleanText($("[data-cy='address']").first().text());
+    cleanText($("[itemprop='address']").first().text()) || cleanText($("[data-cy='address']").first().text());
 
   let contact = "N/A";
   const agentName =
     cleanText($("[data-cy='broker-name']").text()) ||
     cleanText($(".broker-name, .brokerName, .realtor-name").first().text());
   const phone =
-    cleanText($("[data-cy='broker-phone']").text()) ||
-    cleanText($("a[href^='tel:']").first().text());
+    cleanText($("[data-cy='broker-phone']").text()) || cleanText($("a[href^='tel:']").first().text());
   if (agentName || phone) contact = cleanText([agentName, phone].filter(Boolean).join(" - "));
 
   return {
@@ -546,7 +572,7 @@ function parseDuProprioFromHtmlFast(url, html) {
     }
   }
 
-  let condoFees = "N/A";
+  const condoFees = "N/A";
 
   let contact = "N/A";
   const tel = cleanText($("a[href^='tel:']").first().text());
@@ -609,13 +635,6 @@ function parseDuProprioFromStructured(url, structured) {
     }
   }
 
-  // Backup address extraction from OG if LD failed
-  if (!address) {
-    const og = cleanText(structured?.ogTitle || structured?.ogDesc || "");
-    // Not perfect, but sometimes OG includes street + city
-    if (looksLikeRealAddress(og)) address = og;
-  }
-
   const b1 = cleanText(structured?.bedsText || "");
   const b2 = cleanText(structured?.bathsText || "");
   const d1 = cleanText(structured?.dimText || "");
@@ -626,6 +645,11 @@ function parseDuProprioFromStructured(url, structured) {
   if (Number.isFinite(nb)) beds = nb;
   if (Number.isFinite(na)) baths = na;
   if (d1) area = normalizeAreaToFt2(d1);
+
+  if (!address) {
+    const maybe = cleanText(structured?.ogTitle || structured?.ogDesc || "");
+    if (looksLikeRealAddress(maybe)) address = maybe;
+  }
 
   return {
     url,
@@ -648,7 +672,6 @@ async function scrapeCentris(url) {
     return parseCentrisFromHtml(url, direct.html);
   }
 
-  // Centris sometimes hydrates the price client-side
   const html = await fetchHtmlPlaywright(url, {
     expectSelector: "[data-cy='buyPrice'], [data-cy='price'], [data-cy='address']",
   });
@@ -661,15 +684,12 @@ async function scrapeDuProprio(url) {
     return parseDuProprioFromHtmlFast(url, direct.html);
   }
 
-  // Playwright structured scrape
   const structured = await fetchDuProprioStructuredPlaywright(url);
   if (structured && (structured.metaAmount || (structured.ldjson && structured.ldjson.length))) {
     const parsed = parseDuProprioFromStructured(url, structured);
-    // If price still missing, fall through to full HTML
     if (parsed.price && parsed.price !== "N/A") return parsed;
   }
 
-  // Last resort full HTML
   const html = await fetchHtmlPlaywright(url);
   return parseDuProprioFromHtmlFast(url, html);
 }
@@ -692,7 +712,7 @@ app.get("/api/listing", async (req, res) => {
   const existing = inflight.get(key);
   if (existing) {
     try {
-      const listing = await withHardTimeout(existing, 20000, "inflight timeout");
+      const listing = await withHardTimeout(existing, 30000, "inflight timeout");
       return res.json({ ok: true, listing, cached: false, deduped: true });
     } catch (e) {
       return res.status(500).json({ ok: false, error: `Scrape failed: ${e?.message || e}` });
@@ -705,8 +725,8 @@ app.get("/api/listing", async (req, res) => {
       const t0 = Date.now();
 
       let listing;
-      if (src === "centris") listing = await withHardTimeout(scrapeCentris(url), 22000, "centris timeout");
-      else listing = await withHardTimeout(scrapeDuProprio(url), 20000, "duproprio timeout");
+      if (src === "centris") listing = await withHardTimeout(scrapeCentris(url), 35000, "centris timeout");
+      else listing = await withHardTimeout(scrapeDuProprio(url), 30000, "duproprio timeout");
 
       const safeScraped = sanitizeAddressOrBlank(listing.address);
       const finalAddress = safeScraped || cleanText(addressHint) || "N/A";
