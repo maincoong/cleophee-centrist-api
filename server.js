@@ -73,7 +73,7 @@ function moneyToNumber(s) {
 }
 
 function formatMoney(n) {
-  if (!Number.isFinite(n)) return "—";
+  if (!Number.isFinite(n)) return "N/A";
   return n.toLocaleString("en-CA", {
     style: "currency",
     currency: "CAD",
@@ -83,7 +83,7 @@ function formatMoney(n) {
 
 function ensureMonthlyFeesString(raw) {
   const t = cleanText(raw);
-  if (!t || t === "—") return "—";
+  if (!t || t === "N/A") return "N/A";
 
   if (/\/\s*month/i.test(t) || /\bmonthly\b/i.test(t)) return t;
 
@@ -109,9 +109,7 @@ function normalizeAreaToFt2(areaStr) {
   const mFt2 = t.match(/([\d,]+)\s*ft²/i);
   if (mFt2) return `${mFt2[1]} ft²`;
 
-  // If you ever get m² and want to convert, do it on the client toggle
   if (/ft²/i.test(t) || /m²/i.test(t)) return t;
-
   return t;
 }
 
@@ -210,7 +208,6 @@ async function fetchHtmlDirect(url, timeoutMs = 6500) {
 
     const html = await res.text();
 
-    // Quick sanity check to detect stubs / blocks
     if (!html || html.length < 1500) return { ok: false, status: res.status, html };
     const looksHtml = html.includes("<html") || html.toLowerCase().includes("<!doctype html");
     if (!looksHtml) return { ok: false, status: res.status, html };
@@ -261,19 +258,51 @@ async function enableFastRoutes(page) {
   });
 }
 
-async function fetchHtmlPlaywright(url) {
+// Retry wrapper for the exact failure you are seeing
+function isExecutionContextDestroyed(err) {
+  const msg = String(err?.message || err || "");
+  return msg.includes("Execution context was destroyed") || msg.includes("because of a navigation");
+}
+
+async function safeEvaluate(page, fn, { timeoutMs = 5500, retries = 2, label = "eval" } = {}) {
+  let lastErr;
+  for (let i = 0; i <= retries; i += 1) {
+    try {
+      // tiny settle helps when sites do an immediate redirect or hydration nav
+      await page.waitForTimeout(120);
+      return await withHardTimeout(page.evaluate(fn), timeoutMs, `${label} timeout`);
+    } catch (e) {
+      lastErr = e;
+      if (!isExecutionContextDestroyed(e)) throw e;
+      if (i === retries) break;
+      // wait a bit and try again on the new document context
+      await page.waitForTimeout(250);
+    }
+  }
+  throw lastErr;
+}
+
+async function fetchHtmlPlaywright(url, { expectSelector } = {}) {
   await ensureBrowser();
   const page = await context.newPage();
 
-  page.setDefaultNavigationTimeout(9500);
-  page.setDefaultTimeout(9500);
+  page.setDefaultNavigationTimeout(12000);
+  page.setDefaultTimeout(12000);
 
   await enableFastRoutes(page);
 
   try {
-    await withHardTimeout(page.goto(url, { waitUntil: "domcontentloaded" }), 9500, "nav timeout");
-    // Avoid waiting for anything else
-    const html = await withHardTimeout(page.content(), 5500, "content timeout");
+    await withHardTimeout(page.goto(url, { waitUntil: "domcontentloaded" }), 12000, "nav timeout");
+
+    // If we know something that should exist, wait briefly for it.
+    if (expectSelector) {
+      await page.waitForSelector(expectSelector, { timeout: 4000 }).catch(() => {});
+    } else {
+      // brief settle
+      await page.waitForTimeout(180);
+    }
+
+    const html = await withHardTimeout(page.content(), 6500, "content timeout");
     return html;
   } finally {
     await page.close().catch(() => {});
@@ -285,17 +314,22 @@ async function fetchDuProprioStructuredPlaywright(url) {
   await ensureBrowser();
   const page = await context.newPage();
 
-  page.setDefaultNavigationTimeout(9500);
-  page.setDefaultTimeout(9500);
+  page.setDefaultNavigationTimeout(12000);
+  page.setDefaultTimeout(12000);
 
   await enableFastRoutes(page);
 
   try {
-    await withHardTimeout(page.goto(url, { waitUntil: "domcontentloaded" }), 9500, "nav timeout");
+    await withHardTimeout(page.goto(url, { waitUntil: "domcontentloaded" }), 12000, "nav timeout");
 
-    const data = await withHardTimeout(
-      page.evaluate(() => {
+    // If JSON-LD exists, give it a moment to appear.
+    await page.waitForSelector("script[type='application/ld+json']", { timeout: 3500 }).catch(() => {});
+
+    const data = await safeEvaluate(
+      page,
+      () => {
         const getMeta = (sel) => document.querySelector(sel)?.getAttribute("content") || "";
+        const getText = (sel) => (document.querySelector(sel)?.textContent || "").trim();
 
         const metaAmount =
           getMeta("meta[property='product:price:amount']") ||
@@ -307,22 +341,23 @@ async function fetchDuProprioStructuredPlaywright(url) {
           .map((s) => s.textContent || "")
           .filter(Boolean);
 
-        // Try to read quick characteristics if present
-        const getText = (sel) => (document.querySelector(sel)?.textContent || "").trim();
+        // Some pages also expose a usable title
+        const ogTitle = getMeta("meta[property='og:title']") || "";
+        const ogDesc = getMeta("meta[property='og:description']") || "";
 
         return {
           metaAmount,
           ldjson: ld,
-          // These selectors sometimes exist; if they don't, fine.
+          ogTitle,
+          ogDesc,
           bedsText: getText(".listing-main-characteristics__icon--bedrooms ~ .listing-main-characteristics__number"),
           bathsText: getText(".listing-main-characteristics__icon--bathrooms ~ .listing-main-characteristics__number"),
           dimText: getText(
             "span.listing-main-characteristics__number.listing-main-characteristics__number--dimensions"
           ),
         };
-      }),
-      5500,
-      "dp structured eval timeout"
+      },
+      { timeoutMs: 6000, retries: 2, label: "dp structured eval" }
     );
 
     return data;
@@ -348,11 +383,12 @@ process.on("SIGTERM", shutdown);
 function parseCentrisFromHtml(url, html) {
   const $ = load(html);
 
-  let price = "—";
+  let price = "N/A";
   const priceText =
     cleanText($("[data-cy='buyPrice']").first().text()) ||
     cleanText($("[data-cy='price']").first().text()) ||
     cleanText($(".price").first().text());
+
   if (priceText) {
     const m = priceText.match(/\$[\s0-9,]+/);
     if (m) price = cleanText(m[0]);
@@ -385,7 +421,7 @@ function parseCentrisFromHtml(url, html) {
   const rawArea = getCarac("Net area") || getCarac("Area");
   const area = rawArea ? normalizeAreaToFt2(rawArea) : null;
 
-  let condoFees = "—";
+  let condoFees = "N/A";
   const feeRows = $("table tr").toArray();
   for (const r of feeRows) {
     const rowText = cleanText($(r).text()).toLowerCase();
@@ -397,7 +433,7 @@ function parseCentrisFromHtml(url, html) {
       }
     }
   }
-  if (condoFees !== "—") {
+  if (condoFees !== "N/A") {
     const n = moneyToNumber(condoFees);
     if (n != null) condoFees = `${formatMoney(n)} / month`;
   }
@@ -407,7 +443,7 @@ function parseCentrisFromHtml(url, html) {
     cleanText($("[itemprop='address']").first().text()) ||
     cleanText($("[data-cy='address']").first().text());
 
-  let contact = "—";
+  let contact = "N/A";
   const agentName =
     cleanText($("[data-cy='broker-name']").text()) ||
     cleanText($(".broker-name, .brokerName, .realtor-name").first().text());
@@ -434,8 +470,7 @@ function parseCentrisFromHtml(url, html) {
 function parseDuProprioFromHtmlFast(url, html) {
   const $ = load(html);
 
-  // Price from meta only (fast, no full body scan)
-  let price = "—";
+  let price = "N/A";
   const metaAmount =
     cleanText($("meta[property='product:price:amount']").attr("content")) ||
     cleanText($("meta[property='og:price:amount']").attr("content")) ||
@@ -445,7 +480,6 @@ function parseDuProprioFromHtmlFast(url, html) {
     if (n != null) price = formatMoney(n);
   }
 
-  // JSON-LD parse for everything else
   let address = "";
   let beds = null;
   let baths = null;
@@ -465,7 +499,6 @@ function parseDuProprioFromHtmlFast(url, html) {
 
     const nodes = Array.isArray(data) ? data : [data];
     for (const node of nodes) {
-      // Address
       const addr = node?.address || node?.location?.address || node?.offers?.itemOffered?.address || null;
       const street = addr?.streetAddress || null;
       const locality = addr?.addressLocality || "";
@@ -478,7 +511,6 @@ function parseDuProprioFromHtmlFast(url, html) {
         if (looksLikeRealAddress(out)) address = out;
       }
 
-      // Beds/baths/area: sometimes under additionalProperty or floorSize
       const floorSize = node?.floorSize?.value || node?.floorSize?.amount || node?.floorSize || null;
       if (!area && floorSize != null) {
         const v = typeof floorSize === "number" ? String(floorSize) : cleanText(String(floorSize));
@@ -506,7 +538,6 @@ function parseDuProprioFromHtmlFast(url, html) {
         }
       }
 
-      // Some nodes embed a description that contains dimensions like "xxx ft²"
       if (!area) {
         const desc = cleanText(node?.description || "");
         const m = desc.match(/\b([\d,]+)\s*(?:ft²|sqft)\b/i);
@@ -515,12 +546,9 @@ function parseDuProprioFromHtmlFast(url, html) {
     }
   }
 
-  // Fees: do NOT scan whole body (expensive). Look in meta/ld if possible.
-  // If you really need fees, re-add a limited scan later.
-  let condoFees = "—";
+  let condoFees = "N/A";
 
-  // Contact: tel link quick
-  let contact = "—";
+  let contact = "N/A";
   const tel = cleanText($("a[href^='tel:']").first().text());
   if (tel) contact = tel;
 
@@ -538,9 +566,8 @@ function parseDuProprioFromHtmlFast(url, html) {
   };
 }
 
-// Even faster: parse from Playwright structured scrape
 function parseDuProprioFromStructured(url, structured) {
-  let price = "—";
+  let price = "N/A";
   const metaAmount = cleanText(structured?.metaAmount || "");
   if (metaAmount) {
     const n = moneyToNumber(metaAmount);
@@ -582,7 +609,13 @@ function parseDuProprioFromStructured(url, structured) {
     }
   }
 
-  // If the quick UI selectors came back, use them
+  // Backup address extraction from OG if LD failed
+  if (!address) {
+    const og = cleanText(structured?.ogTitle || structured?.ogDesc || "");
+    // Not perfect, but sometimes OG includes street + city
+    if (looksLikeRealAddress(og)) address = og;
+  }
+
   const b1 = cleanText(structured?.bedsText || "");
   const b2 = cleanText(structured?.bathsText || "");
   const d1 = cleanText(structured?.dimText || "");
@@ -603,34 +636,37 @@ function parseDuProprioFromStructured(url, structured) {
     baths: Number.isFinite(baths) ? baths : null,
     levels: null,
     area: area ? normalizeAreaToFt2(area) : null,
-    condoFees: "—",
-    contact: "—",
+    condoFees: "N/A",
+    contact: "N/A",
   };
 }
 
 // -------------------- Scrape orchestrator --------------------
 async function scrapeCentris(url) {
-  // Direct first
   const direct = await fetchHtmlDirect(url, 7000);
   if (direct.ok && !looksBlocked(direct.html)) {
     return parseCentrisFromHtml(url, direct.html);
   }
-  // Fallback
-  const html = await fetchHtmlPlaywright(url);
+
+  // Centris sometimes hydrates the price client-side
+  const html = await fetchHtmlPlaywright(url, {
+    expectSelector: "[data-cy='buyPrice'], [data-cy='price'], [data-cy='address']",
+  });
   return parseCentrisFromHtml(url, html);
 }
 
 async function scrapeDuProprio(url) {
-  // Direct first, with shorter timeout because it usually works fast
   const direct = await fetchHtmlDirect(url, 5500);
   if (direct.ok && !looksBlocked(direct.html)) {
     return parseDuProprioFromHtmlFast(url, direct.html);
   }
 
-  // Playwright fallback: structured scrape (FAST) before doing full page.content
+  // Playwright structured scrape
   const structured = await fetchDuProprioStructuredPlaywright(url);
   if (structured && (structured.metaAmount || (structured.ldjson && structured.ldjson.length))) {
-    return parseDuProprioFromStructured(url, structured);
+    const parsed = parseDuProprioFromStructured(url, structured);
+    // If price still missing, fall through to full HTML
+    if (parsed.price && parsed.price !== "N/A") return parsed;
   }
 
   // Last resort full HTML
@@ -656,7 +692,7 @@ app.get("/api/listing", async (req, res) => {
   const existing = inflight.get(key);
   if (existing) {
     try {
-      const listing = await withHardTimeout(existing, 16000, "inflight timeout");
+      const listing = await withHardTimeout(existing, 20000, "inflight timeout");
       return res.json({ ok: true, listing, cached: false, deduped: true });
     } catch (e) {
       return res.status(500).json({ ok: false, error: `Scrape failed: ${e?.message || e}` });
@@ -669,11 +705,11 @@ app.get("/api/listing", async (req, res) => {
       const t0 = Date.now();
 
       let listing;
-      if (src === "centris") listing = await withHardTimeout(scrapeCentris(url), 18000, "centris timeout");
-      else listing = await withHardTimeout(scrapeDuProprio(url), 14000, "duproprio timeout");
+      if (src === "centris") listing = await withHardTimeout(scrapeCentris(url), 22000, "centris timeout");
+      else listing = await withHardTimeout(scrapeDuProprio(url), 20000, "duproprio timeout");
 
       const safeScraped = sanitizeAddressOrBlank(listing.address);
-      const finalAddress = safeScraped || cleanText(addressHint) || "—";
+      const finalAddress = safeScraped || cleanText(addressHint) || "N/A";
       const finalListing = { ...listing, address: finalAddress };
 
       setCached(key, finalListing);
@@ -703,7 +739,6 @@ app.get("/", (req, res) => {
 });
 
 app.listen(PORT, async () => {
-  // Warm Playwright so fallback is fast when it happens
   try {
     await ensureBrowser();
   } catch (e) {
