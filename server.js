@@ -12,7 +12,7 @@ const PORT = process.env.PORT || 3000;
 
 app.use(compression());
 
-// -------------------- CORS (fix for joeymakesweb.com + www) --------------------
+// -------------------- CORS --------------------
 const ALLOWED_ORIGINS = new Set([
   "https://joeymakesweb.com",
   "https://www.joeymakesweb.com",
@@ -22,12 +22,10 @@ const ALLOWED_ORIGINS = new Set([
 
 app.use((req, res, next) => {
   const origin = req.headers.origin;
-
   if (origin && ALLOWED_ORIGINS.has(origin)) {
     res.setHeader("Access-Control-Allow-Origin", origin);
     res.setHeader("Vary", "Origin");
   }
-
   res.setHeader("Access-Control-Allow-Methods", "GET,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
   next();
@@ -35,12 +33,10 @@ app.use((req, res, next) => {
 
 app.options("*", (req, res) => {
   const origin = req.headers.origin;
-
   if (origin && ALLOWED_ORIGINS.has(origin)) {
     res.setHeader("Access-Control-Allow-Origin", origin);
     res.setHeader("Vary", "Origin");
   }
-
   res.setHeader("Access-Control-Allow-Methods", "GET,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
   res.sendStatus(204);
@@ -148,7 +144,7 @@ function looksLikeRealAddress(s) {
   if (!streetWord.test(t)) return false;
 
   const words = t.split(/\s+/).filter(Boolean);
-  if (words.length > 18) return false;
+  if (words.length > 22) return false;
 
   if (/\b(take a look|discover|invites you|for sale|commission[- ]?free)\b/i.test(t)) return false;
 
@@ -160,7 +156,7 @@ function sanitizeAddressOrBlank(s) {
   return looksLikeRealAddress(t) ? t : "";
 }
 
-// -------------------- Semaphore (avoid dogpiling) --------------------
+// -------------------- Semaphore --------------------
 function createSemaphore(max = 1) {
   let active = 0;
   const queue = [];
@@ -195,7 +191,17 @@ async function withHardTimeout(promise, ms, label) {
   }
 }
 
-// -------------------- Direct HTTP fetch (fast) --------------------
+function looksBlocked(html) {
+  const t = (html || "").toLowerCase();
+  if (!t) return true;
+  if (t.includes("captcha")) return true;
+  if (t.includes("access denied")) return true;
+  if (t.includes("please enable javascript")) return true;
+  if (t.includes("unusual traffic")) return true;
+  return false;
+}
+
+// -------------------- Direct HTTP fetch (fast path) --------------------
 async function fetchHtmlDirect(url, timeoutMs = 6500) {
   const controller = new AbortController();
   const t = setTimeout(() => controller.abort(), timeoutMs);
@@ -208,10 +214,11 @@ async function fetchHtmlDirect(url, timeoutMs = 6500) {
       headers: {
         "User-Agent":
           "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
-        "Accept-Language": "en-CA,en;q=0.9",
+        "Accept-Language": "en-CA,en;q=0.9,fr-CA;q=0.8,fr;q=0.7",
         Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Cache-Control": "no-cache",
         Pragma: "no-cache",
+        Referer: "https://www.centris.ca/",
       },
     });
 
@@ -220,7 +227,7 @@ async function fetchHtmlDirect(url, timeoutMs = 6500) {
     const html = await res.text();
 
     if (!html || html.length < 1200) return { ok: false, status: res.status, html };
-    const looksHtml = html.includes("<html") || html.toLowerCase().includes("<!doctype html");
+    const looksHtml = html.toLowerCase().includes("<html") || html.toLowerCase().includes("<!doctype html");
     if (!looksHtml) return { ok: false, status: res.status, html };
 
     return { ok: true, status: res.status, html };
@@ -229,16 +236,6 @@ async function fetchHtmlDirect(url, timeoutMs = 6500) {
   } finally {
     clearTimeout(t);
   }
-}
-
-function looksBlocked(html) {
-  const t = (html || "").toLowerCase();
-  if (!t) return true;
-  if (t.includes("captcha")) return true;
-  if (t.includes("access denied")) return true;
-  if (t.includes("please enable javascript")) return true;
-  if (t.includes("unusual traffic")) return true;
-  return false;
 }
 
 // -------------------- Playwright global reuse --------------------
@@ -264,47 +261,29 @@ async function ensureBrowser() {
       "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
     viewport: { width: 1280, height: 720 },
     locale: "en-CA",
-    extraHTTPHeaders: { "Accept-Language": "en-CA,en;q=0.9" },
+    extraHTTPHeaders: {
+      "Accept-Language": "en-CA,en;q=0.9,fr-CA;q=0.8,fr;q=0.7",
+    },
   });
 
+  // tiny stealth
   await context.addInitScript(() => {
     Object.defineProperty(navigator, "webdriver", { get: () => undefined });
   });
 }
 
-async function enableFastRoutes(page) {
+// For DuProprio we keep speed optimizations.
+// For Centris we DO NOT block images/fonts because it often triggers bot/challenge pages.
+async function enableFastRoutesDuProprio(page) {
   await page.route("**/*", (route) => {
     const type = route.request().resourceType();
-    // Keep scripts + styles. Block images/fonts/media for speed.
     if (type === "image" || type === "media" || type === "font") return route.abort();
     return route.continue();
   });
 }
 
-// -------------------- Playwright safety helpers --------------------
-function isExecutionContextDestroyed(err) {
-  const msg = String(err?.message || err || "");
-  return msg.includes("Execution context was destroyed") || msg.includes("because of a navigation");
-}
-
-async function safeEvaluate(page, fn, { timeoutMs = 10000, retries = 2, label = "eval" } = {}) {
-  let lastErr;
-  for (let i = 0; i <= retries; i += 1) {
-    try {
-      await page.waitForTimeout(120);
-      return await withHardTimeout(page.evaluate(fn), timeoutMs, `${label} timeout`);
-    } catch (e) {
-      lastErr = e;
-      if (!isExecutionContextDestroyed(e)) throw e;
-      if (i === retries) break;
-      await page.waitForTimeout(350);
-    }
-  }
-  throw lastErr;
-}
-
 async function gotoWithRetries(page, url, opts = {}) {
-  const { navTimeoutMs = 30000, tries = 2, waitUntil = "domcontentloaded" } = opts;
+  const { navTimeoutMs = 25000, tries = 1, waitUntil = "domcontentloaded" } = opts;
   let lastErr;
 
   for (let attempt = 0; attempt <= tries; attempt += 1) {
@@ -313,24 +292,12 @@ async function gotoWithRetries(page, url, opts = {}) {
       return;
     } catch (e) {
       lastErr = e;
-      const msg = String(e?.message || e || "");
-      const isTimeout = msg.toLowerCase().includes("timeout");
-      if (!isTimeout) throw e;
-
+      const msg = String(e?.message || e || "").toLowerCase();
+      if (!msg.includes("timeout")) throw e;
       try {
-        await page.waitForTimeout(300);
         await page.evaluate(() => (window.stop ? window.stop() : null)).catch(() => {});
       } catch {}
-
-      if (attempt < tries) {
-        await page.waitForTimeout(700);
-        try {
-          await withHardTimeout(page.goto(url, { waitUntil: "commit" }), navTimeoutMs, "nav timeout");
-          return;
-        } catch (e2) {
-          lastErr = e2;
-        }
-      }
+      if (attempt < tries) await page.waitForTimeout(600);
     }
   }
 
@@ -344,159 +311,29 @@ async function waitForAny(page, selectors, timeoutMs) {
       .then(() => sel)
       .catch(() => null)
   );
-
   const winner = await Promise.race(tasks);
   return winner || "";
 }
 
-// -------------------- Playwright fetchers --------------------
-async function fetchHtmlPlaywright(url, { expectAnySelectors = [] } = {}) {
-  await ensureBrowser();
-  const page = await context.newPage();
-
-  page.setDefaultNavigationTimeout(30000);
-  page.setDefaultTimeout(30000);
-
-  await enableFastRoutes(page);
-
-  try {
-    await gotoWithRetries(page, url, { navTimeoutMs: 30000, tries: 2, waitUntil: "domcontentloaded" });
-
-    if (expectAnySelectors.length) {
-      await waitForAny(page, expectAnySelectors, 16000).catch(() => "");
-      await page.waitForTimeout(200);
-    } else {
-      await page.waitForTimeout(250);
-    }
-
-    const html = await withHardTimeout(page.content(), 14000, "content timeout");
-    const title = await page.title().catch(() => "");
-    const finalUrl = page.url();
-
-    return { ok: true, html, title, finalUrl };
-  } finally {
-    await page.close().catch(() => {});
-  }
+function isExecutionContextDestroyed(err) {
+  const msg = String(err?.message || err || "");
+  return msg.includes("Execution context was destroyed") || msg.includes("because of a navigation");
 }
 
-async function fetchDuProprioStructuredPlaywright(url) {
-  await ensureBrowser();
-  const page = await context.newPage();
-
-  page.setDefaultNavigationTimeout(30000);
-  page.setDefaultTimeout(30000);
-
-  await enableFastRoutes(page);
-
-  try {
-    await gotoWithRetries(page, url, { navTimeoutMs: 30000, tries: 2, waitUntil: "domcontentloaded" });
-
-    // CRITICAL FIX:
-    // Do NOT hard wait for a single selector like .listing-price__amount.
-    // Wait for ANY signal, then evaluate anyway.
-    await waitForAny(
-      page,
-      [
-        ".listing-price__amount",
-        ".listing-main-characteristics__item",
-        "script[type='application/ld+json']",
-        "meta[property='product:price:amount']",
-        "meta[property='og:price:amount']",
-        "body",
-      ],
-      16000
-    ).catch(() => "");
-
-    await page.waitForTimeout(200);
-
-    const data = await safeEvaluate(
-      page,
-      () => {
-        const toLine = (s) => (s || "").replace(/\s+/g, " ").trim();
-        const getMeta = (sel) => document.querySelector(sel)?.getAttribute("content") || "";
-        const getText = (sel) => toLine(document.querySelector(sel)?.textContent || "");
-
-        const domPriceText = getText(".listing-price__amount");
-
-        const metaAmount =
-          getMeta("meta[property='product:price:amount']") ||
-          getMeta("meta[property='og:price:amount']") ||
-          getMeta("meta[name='twitter:data1']") ||
-          "";
-
-        let bedsText = "";
-        let bathsText = "";
-        let dimText = "";
-
-        const items = Array.from(document.querySelectorAll(".listing-main-characteristics__item"));
-        for (const item of items) {
-          const number = toLine(item.querySelector(".listing-main-characteristics__number")?.textContent || "");
-          const title = toLine(item.querySelector(".listing-main-characteristics__title")?.textContent || "");
-          const titleLower = title.toLowerCase();
-          const cls = (item.getAttribute("class") || "").toLowerCase();
-
-          if (!bedsText && (titleLower === "bedrooms" || titleLower.includes("bedroom"))) bedsText = number;
-          if (
-            !bathsText &&
-            (titleLower === "bathrooms" || titleLower.includes("bathroom") || titleLower === "bath")
-          )
-            bathsText = number;
-
-          if (
-            !dimText &&
-            (cls.includes("item-dimensions") || number.includes("ft²") || number.toLowerCase().includes("sqft"))
-          ) {
-            dimText = number;
-          }
-        }
-
-        // Condo fees: targeted scan (bounded)
-        let condoFeesText = "";
-        const nodes = Array.from(document.querySelectorAll("div, span, li, p")).slice(0, 2600);
-        for (let i = 0; i < nodes.length; i += 1) {
-          const line = toLine(nodes[i].textContent || "");
-          const low = line.toLowerCase();
-          if (!line) continue;
-
-          if (low.includes("condo fees") || low.includes("condominium fees") || low.includes("frais de condo")) {
-            const m = line.match(/\$\s*[\d\s,]{2,}(?:\.\d{2})?/);
-            if (m) {
-              condoFeesText = m[0];
-              break;
-            }
-            const next = toLine(nodes[i + 1]?.textContent || "");
-            const m2 = next.match(/\$\s*[\d\s,]{2,}(?:\.\d{2})?/);
-            if (m2) {
-              condoFeesText = m2[0];
-              break;
-            }
-          }
-        }
-
-        const ld = Array.from(document.querySelectorAll("script[type='application/ld+json']"))
-          .map((s) => s.textContent || "")
-          .filter(Boolean);
-
-        // Weak fallback price (if dom selector not present but price is in text)
-        let weakPrice = "";
-        if (!domPriceText) {
-          const bodyText = toLine(document.body?.innerText || "");
-          const m = bodyText.match(/\$\s*[\d\s,]{3,}/);
-          if (m) weakPrice = m[0];
-        }
-
-        return { domPriceText, metaAmount, bedsText, bathsText, dimText, condoFeesText, ldjson: ld, weakPrice };
-      },
-      { timeoutMs: 10000, retries: 2, label: "dp structured eval" }
-    );
-
-    const title = await page.title().catch(() => "");
-    const finalUrl = page.url();
-
-    return { ok: true, data, title, finalUrl };
-  } finally {
-    await page.close().catch(() => {});
+async function safeEvaluate(page, fn, { timeoutMs = 9000, retries = 1, label = "eval" } = {}) {
+  let lastErr;
+  for (let i = 0; i <= retries; i += 1) {
+    try {
+      await page.waitForTimeout(100);
+      return await withHardTimeout(page.evaluate(fn), timeoutMs, `${label} timeout`);
+    } catch (e) {
+      lastErr = e;
+      if (!isExecutionContextDestroyed(e)) throw e;
+      if (i === retries) break;
+      await page.waitForTimeout(300);
+    }
   }
+  throw lastErr;
 }
 
 async function shutdown() {
@@ -512,7 +349,7 @@ async function shutdown() {
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
 
-// -------------------- Centris parser (cheerio) --------------------
+// -------------------- Centris parsing (cheerio) --------------------
 function parseCentrisFromHtml(url, html) {
   const $ = load(html);
 
@@ -521,7 +358,6 @@ function parseCentrisFromHtml(url, html) {
     cleanText($("[data-cy='buyPrice']").first().text()) ||
     cleanText($("[data-cy='price']").first().text()) ||
     cleanText($(".price").first().text());
-
   if (priceText) {
     const m = priceText.match(/\$[\s0-9,]+/);
     if (m) price = cleanText(m[0]);
@@ -566,8 +402,12 @@ function parseCentrisFromHtml(url, html) {
   }
   condoFees = ensureMonthlyFeesString(condoFees);
 
-  let address =
-    cleanText($("[itemprop='address']").first().text()) || cleanText($("[data-cy='address']").first().text());
+  // ✅ screenshot shows h2[itemprop="address"]
+  const address =
+    cleanText($("h2[itemprop='address']").first().text()) ||
+    cleanText($("[itemprop='address']").first().text()) ||
+    cleanText($("[data-cy='address']").first().text()) ||
+    "";
 
   let contact = "N/A";
   const agentName =
@@ -591,7 +431,46 @@ function parseCentrisFromHtml(url, html) {
   };
 }
 
-// -------------------- DuProprio parser (cheerio) --------------------
+// -------------------- Centris session-style Playwright (key fix) --------------------
+async function fetchCentrisHtmlPlaywrightSession(url) {
+  await ensureBrowser();
+  const page = await context.newPage();
+  page.setDefaultNavigationTimeout(30000);
+  page.setDefaultTimeout(30000);
+
+  try {
+    // Step 1: visit homepage to get cookies/session
+    await gotoWithRetries(page, "https://www.centris.ca/en", { navTimeoutMs: 25000, tries: 1, waitUntil: "domcontentloaded" });
+    await page.waitForTimeout(250);
+
+    // Step 2: visit listing with referer
+    await page.setExtraHTTPHeaders({
+      Referer: "https://www.centris.ca/en",
+    });
+
+    // networkidle helps Centris pages that fetch data after DOMContentLoaded
+    await gotoWithRetries(page, url, { navTimeoutMs: 30000, tries: 1, waitUntil: "networkidle" });
+
+    // wait for key signals
+    await waitForAny(
+      page,
+      ["[data-cy='buyPrice']", "[data-cy='price']", "h2[itemprop='address']", ".row.teaser", "body"],
+      14000
+    ).catch(() => "");
+
+    await page.waitForTimeout(250);
+
+    const html = await withHardTimeout(page.content(), 14000, "content timeout");
+    const title = await page.title().catch(() => "");
+    const finalUrl = page.url();
+
+    return { ok: true, html, title, finalUrl };
+  } finally {
+    await page.close().catch(() => {});
+  }
+}
+
+// -------------------- DuProprio parsing (cheerio) --------------------
 function parseDuProprioFromHtml(url, html) {
   const $ = load(html);
 
@@ -655,8 +534,10 @@ function parseDuProprioFromHtml(url, html) {
   }
   condoFees = ensureMonthlyFeesString(condoFees);
 
-  let address =
-    cleanText($(".listing-address").first().text()) || cleanText($("[class*='listing-address']").first().text()) || "";
+  const address =
+    cleanText($(".listing-address").first().text()) ||
+    cleanText($("[class*='listing-address']").first().text()) ||
+    "";
 
   let contact = "N/A";
   const tel = cleanText($("a[href^='tel:']").first().text());
@@ -676,120 +557,90 @@ function parseDuProprioFromHtml(url, html) {
   };
 }
 
-function parseDuProprioFromStructured(url, payload) {
-  const structured = payload?.data || {};
-
-  let price = "N/A";
-  const domPrice = cleanText(structured.domPriceText || "");
-  if (domPrice) price = domPrice;
-
-  if (price === "N/A") {
-    const metaAmount = cleanText(structured.metaAmount || "");
-    if (metaAmount) {
-      const n = moneyToNumber(metaAmount);
-      if (n != null) price = formatMoney(n);
-    }
-  }
-
-  if (price === "N/A") {
-    const weak = cleanText(structured.weakPrice || "");
-    if (weak) price = weak;
-  }
-
-  const b1 = cleanText(structured.bedsText || "");
-  const b2 = cleanText(structured.bathsText || "");
-  const d1 = cleanText(structured.dimText || "");
-
-  const nb = b1 ? Number(b1.replace(/[^\d.]/g, "")) : null;
-  const na = b2 ? Number(b2.replace(/[^\d.]/g, "")) : null;
-
-  const beds = Number.isFinite(nb) ? nb : null;
-  const baths = Number.isFinite(na) ? na : null;
-  const area = d1 ? normalizeAreaToFt2(d1) : null;
-
-  let condoFees = cleanText(structured.condoFeesText || "") || "N/A";
-  if (condoFees && condoFees !== "N/A" && !condoFees.includes("$")) {
-    const maybe = extractMoneyFromText(condoFees);
-    if (maybe) condoFees = maybe;
-  }
-  condoFees = ensureMonthlyFeesString(condoFees);
-
-  return {
-    url,
-    source: "DuProprio",
-    address: "",
-    price,
-    beds,
-    baths,
-    levels: null,
-    area,
-    condoFees,
-    contact: "N/A",
-    _diag: {
-      title: payload?.title || "",
-      finalUrl: payload?.finalUrl || "",
-    },
-  };
-}
-
-// -------------------- Scrape orchestrator --------------------
-async function scrapeCentris(url) {
+// -------------------- Scrapers --------------------
+async function scrapeCentris(url, addressHint) {
+  // 1) FAST direct fetch
   const direct = await fetchHtmlDirect(url, 7000);
-  if (direct.ok && !looksBlocked(direct.html)) return parseCentrisFromHtml(url, direct.html);
-
-  const pw = await fetchHtmlPlaywright(url, {
-    expectAnySelectors: ["[data-cy='buyPrice']", "[data-cy='price']", "[data-cy='address']", "body"],
-  });
-
-  if (!pw.ok || !pw.html || pw.html.length < 1200 || looksBlocked(pw.html)) {
-    throw new Error(`centris blocked/empty (title="${pw?.title || ""}" url="${pw?.finalUrl || ""}")`);
+  if (direct.ok && !looksBlocked(direct.html)) {
+    const parsed = parseCentrisFromHtml(url, direct.html);
+    if (parsed.price !== "N/A" || parsed.beds != null || parsed.baths != null || parsed.address) return parsed;
   }
 
-  return parseCentrisFromHtml(url, pw.html);
+  // 2) Playwright "real session" fetch (cookies + networkidle)
+  const pw = await fetchCentrisHtmlPlaywrightSession(url);
+
+  // If blocked, DO NOT throw.
+  // Return a best-effort listing so your frontend can still show something.
+  if (!pw?.html || pw.html.length < 1200 || looksBlocked(pw.html)) {
+    return {
+      url,
+      source: "Centris",
+      address: cleanText(addressHint || "") || "",
+      price: "N/A",
+      beds: null,
+      baths: null,
+      levels: null,
+      area: null,
+      condoFees: "N/A",
+      contact: "N/A",
+      _blocked: true,
+      _diag: {
+        title: pw?.title || "",
+        finalUrl: pw?.finalUrl || "",
+      },
+    };
+  }
+
+  const parsed = parseCentrisFromHtml(url, pw.html);
+  return parsed;
 }
 
 async function scrapeDuProprio(url) {
-  // direct fetch if possible
+  // Direct
   const direct = await fetchHtmlDirect(url, 6500);
   if (direct.ok && !looksBlocked(direct.html)) {
     const parsed = parseDuProprioFromHtml(url, direct.html);
     if (parsed.price !== "N/A" || parsed.beds != null || parsed.area != null) return parsed;
   }
 
-  // structured playwright without brittle selector waits
-  let structuredPayload = null;
+  // Playwright (fast routes ok for DP)
+  await ensureBrowser();
+  const page = await context.newPage();
+  page.setDefaultNavigationTimeout(25000);
+  page.setDefaultTimeout(25000);
+  await enableFastRoutesDuProprio(page);
+
   try {
-    structuredPayload = await fetchDuProprioStructuredPlaywright(url);
-    if (structuredPayload?.ok) {
-      const parsed = parseDuProprioFromStructured(url, structuredPayload);
-      if (parsed.price !== "N/A" || parsed.beds != null || parsed.area != null) return parsed;
+    await gotoWithRetries(page, url, { navTimeoutMs: 25000, tries: 1, waitUntil: "domcontentloaded" });
+    await waitForAny(
+      page,
+      [
+        ".listing-price__amount",
+        ".listing-main-characteristics__item",
+        "meta[property='product:price:amount']",
+        "script[type='application/ld+json']",
+        "body",
+      ],
+      12000
+    ).catch(() => "");
+    await page.waitForTimeout(180);
+
+    const html = await withHardTimeout(page.content(), 12000, "content timeout");
+    const title = await page.title().catch(() => "");
+    const finalUrl = page.url();
+
+    if (!html || html.length < 1200 || looksBlocked(html)) {
+      throw new Error(`duproprio blocked/empty (title="${title}" url="${finalUrl}")`);
     }
-  } catch {
-    // continue to full HTML fallback
+
+    const parsed = parseDuProprioFromHtml(url, html);
+    if (parsed.price === "N/A" && parsed.beds == null && parsed.area == null) {
+      throw new Error(`duproprio missing fields (title="${title}" url="${finalUrl}")`);
+    }
+    return parsed;
+  } finally {
+    await page.close().catch(() => {});
   }
-
-  // full HTML playwright fallback
-  const pw = await fetchHtmlPlaywright(url, {
-    expectAnySelectors: [
-      ".listing-price__amount",
-      ".listing-main-characteristics__item",
-      "script[type='application/ld+json']",
-      "meta[property='product:price:amount']",
-      "body",
-    ],
-  });
-
-  if (!pw.ok || !pw.html || pw.html.length < 1200 || looksBlocked(pw.html)) {
-    throw new Error(`duproprio blocked/empty (title="${pw?.title || ""}" url="${pw?.finalUrl || ""}")`);
-  }
-
-  const parsed = parseDuProprioFromHtml(url, pw.html);
-
-  if (parsed.price === "N/A" && parsed.beds == null && parsed.area == null) {
-    throw new Error(`duproprio missing fields (title="${pw?.title || ""}" url="${pw?.finalUrl || ""}")`);
-  }
-
-  return parsed;
 }
 
 // -------------------- API --------------------
@@ -814,7 +665,24 @@ app.get("/api/listing", async (req, res) => {
       const listing = await withHardTimeout(existing, 30000, "inflight timeout");
       return res.json({ ok: true, listing, cached: false, deduped: true });
     } catch (e) {
-      return res.status(500).json({ ok: false, error: `Scrape failed: ${e?.message || e}` });
+      // return best-effort instead of 500
+      return res.json({
+        ok: true,
+        listing: {
+          url,
+          source: src === "centris" ? "Centris" : "DuProprio",
+          address: cleanText(addressHint) || "N/A",
+          price: "N/A",
+          beds: null,
+          baths: null,
+          levels: null,
+          area: null,
+          condoFees: "N/A",
+          contact: "N/A",
+          _error: `Scrape failed: ${e?.message || e}`,
+        },
+        cached: false,
+      });
     }
   }
 
@@ -824,22 +692,22 @@ app.get("/api/listing", async (req, res) => {
       const t0 = Date.now();
 
       let listing;
-      if (src === "centris") listing = await withHardTimeout(scrapeCentris(url), 42000, "centris timeout");
+      if (src === "centris") listing = await withHardTimeout(scrapeCentris(url, addressHint), 42000, "centris timeout");
       else listing = await withHardTimeout(scrapeDuProprio(url), 42000, "duproprio timeout");
 
       const safeScraped = sanitizeAddressOrBlank(listing.address);
       const finalAddress = safeScraped || cleanText(addressHint) || "N/A";
       const finalListing = { ...listing, address: finalAddress };
 
-      // Don't cache garbage results
       const looksGood =
         finalListing.price !== "N/A" ||
         finalListing.beds != null ||
         finalListing.baths != null ||
         (finalListing.area && finalListing.area !== "N/A") ||
-        (finalListing.condoFees && finalListing.condoFees !== "N/A");
+        (finalListing.condoFees && finalListing.condoFees !== "N/A") ||
+        (finalListing.address && finalListing.address !== "N/A");
 
-      if (looksGood) setCached(key, finalListing);
+      if (looksGood && !finalListing._blocked) setCached(key, finalListing);
 
       console.log(`[scrape] ${src} ${Date.now() - t0}ms refresh=${refresh ? "1" : "0"} ${url}`);
       return finalListing;
@@ -854,7 +722,25 @@ app.get("/api/listing", async (req, res) => {
     const listing = await p;
     return res.json({ ok: true, listing, cached: false, refresh });
   } catch (e) {
-    return res.status(500).json({ ok: false, error: `Scrape failed: ${e?.message || e}` });
+    // IMPORTANT: never 500 for Centris blocks. Return something usable.
+    return res.json({
+      ok: true,
+      listing: {
+        url,
+        source: src === "centris" ? "Centris" : "DuProprio",
+        address: cleanText(addressHint) || "N/A",
+        price: "N/A",
+        beds: null,
+        baths: null,
+        levels: null,
+        area: null,
+        condoFees: "N/A",
+        contact: "N/A",
+        _error: `Scrape failed: ${e?.message || e}`,
+      },
+      cached: false,
+      refresh,
+    });
   } finally {
     inflight.delete(key);
   }
@@ -867,7 +753,7 @@ app.get("/", (req, res) => {
 
 app.listen(PORT, async () => {
   try {
-    await ensureBrowser();
+    await ensureBrowser(); // warm-up
   } catch (e) {
     console.error("Browser warmup failed:", e?.message || e);
   }
