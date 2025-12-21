@@ -81,6 +81,12 @@ function formatMoney(n) {
   });
 }
 
+function extractMoneyFromText(s) {
+  const t = cleanText(s);
+  const m = t.match(/\$\s*[\d\s,]{3,}/); // "$579,000"
+  return m ? cleanText(m[0]) : "";
+}
+
 function ensureMonthlyFeesString(raw) {
   const t = cleanText(raw);
   if (!t || t === "N/A") return "N/A";
@@ -341,7 +347,6 @@ async function fetchHtmlPlaywright(url, { expectSelector } = {}) {
   }
 }
 
-// Ultra-fast DuProprio fallback: read JSON-LD + meta without serializing full HTML
 async function fetchDuProprioStructuredPlaywright(url) {
   await ensureBrowser();
   const page = await context.newPage();
@@ -354,7 +359,10 @@ async function fetchDuProprioStructuredPlaywright(url) {
   try {
     await gotoWithRetries(page, url, { navTimeoutMs: 25000, tries: 2, waitUntil: "domcontentloaded" });
 
-    await page.waitForSelector("script[type='application/ld+json']", { timeout: 6000 }).catch(() => {});
+    // These are the real DOM nodes you showed in devtools
+    await page.waitForSelector(".listing-price__amount", { timeout: 6500 }).catch(() => {});
+    await page.waitForSelector(".listing-main-characteristics__item", { timeout: 6500 }).catch(() => {});
+    await page.waitForSelector("script[type='application/ld+json']", { timeout: 6500 }).catch(() => {});
 
     const data = await safeEvaluate(
       page,
@@ -372,22 +380,79 @@ async function fetchDuProprioStructuredPlaywright(url) {
           .map((s) => s.textContent || "")
           .filter(Boolean);
 
-        const ogTitle = getMeta("meta[property='og:title']") || "";
-        const ogDesc = getMeta("meta[property='og:description']") || "";
+        const domPriceText = getText(".listing-price__amount");
+
+        // Characteristics: gather from the "item" blocks
+        let bedsText = "";
+        let bathsText = "";
+        let dimText = "";
+
+        const items = Array.from(document.querySelectorAll(".listing-main-characteristics__item"));
+        for (const item of items) {
+          const isDim = item.className.includes("item-dimensions");
+          const number = (item.querySelector(".listing-main-characteristics__number")?.textContent || "").trim();
+          const title = (item.querySelector(".listing-main-characteristics__title")?.textContent || "").trim();
+
+          const t = title.toLowerCase();
+          if (!bedsText && (t.includes("bedroom") || t.includes("bedrooms"))) bedsText = number;
+          if (!bathsText && (t.includes("bathroom") || t.includes("bathrooms") || t === "bath")) bathsText = number;
+
+          // Dimensions block sometimes has no title, but has the number span
+          if (!dimText && isDim && number) dimText = number;
+
+          // If title is blank but number contains ft², treat as dimensions
+          if (!dimText && number && (number.includes("ft²") || number.toLowerCase().includes("sqft"))) dimText = number;
+        }
+
+        // Condo fees: best effort.
+        // DuProprio layouts vary, so do a small targeted text scan without returning full body text.
+        let condoFeesText = "";
+        const candidates = Array.from(document.querySelectorAll("div, span, li, p"))
+          .slice(0, 2500) // limit work
+          .map((n) => (n.textContent || "").replace(/\s+/g, " ").trim())
+          .filter(Boolean);
+
+        for (let i = 0; i < candidates.length; i += 1) {
+          const line = candidates[i];
+          const low = line.toLowerCase();
+          if (low.includes("condo fees") || low.includes("condominium fees") || low.includes("frais de condo")) {
+            // Try same line first: "Condo fees $XXX"
+            const m = line.match(/\$\s*[\d\s,]{2,}(?:\.\d{2})?/);
+            if (m) {
+              condoFeesText = m[0];
+              break;
+            }
+            // Try the next line as value
+            const next = candidates[i + 1] || "";
+            const m2 = next.match(/\$\s*[\d\s,]{2,}(?:\.\d{2})?/);
+            if (m2) {
+              condoFeesText = m2[0];
+              break;
+            }
+          }
+        }
+
+        // If still nothing, try a smaller selector guess that exists on some listings
+        if (!condoFeesText) {
+          const feeGuess =
+            getText(".listing-fees__amount") ||
+            getText(".listing-financial__amount") ||
+            getText("[class*='condo'][class*='fees']") ||
+            "";
+          condoFeesText = feeGuess;
+        }
 
         return {
           metaAmount,
           ldjson: ld,
-          ogTitle,
-          ogDesc,
-          bedsText: getText(".listing-main-characteristics__icon--bedrooms ~ .listing-main-characteristics__number"),
-          bathsText: getText(".listing-main-characteristics__icon--bathrooms ~ .listing-main-characteristics__number"),
-          dimText: getText(
-            "span.listing-main-characteristics__number.listing-main-characteristics__number--dimensions"
-          ),
+          domPriceText,
+          bedsText,
+          bathsText,
+          dimText,
+          condoFeesText,
         };
       },
-      { timeoutMs: 7000, retries: 2, label: "dp structured eval" }
+      { timeoutMs: 8000, retries: 2, label: "dp structured eval" }
     );
 
     return data;
@@ -439,7 +504,9 @@ function parseCentrisFromHtml(url, html) {
     for (const t of titles) {
       const tt = cleanText($(t).text()).toLowerCase();
       if (tt === label.toLowerCase()) {
-        const val = cleanText($(t).closest(".carac-container, .carac").find(".carac-value").first().text());
+        const val = cleanText(
+          $(t).closest(".carac-container, .carac").find(".carac-value").first().text()
+        );
         if (val) return val;
       }
     }
@@ -461,21 +528,19 @@ function parseCentrisFromHtml(url, html) {
       }
     }
   }
-  if (condoFees !== "N/A") {
-    const n = moneyToNumber(condoFees);
-    if (n != null) condoFees = `${formatMoney(n)} / month`;
-  }
   condoFees = ensureMonthlyFeesString(condoFees);
 
   let address =
-    cleanText($("[itemprop='address']").first().text()) || cleanText($("[data-cy='address']").first().text());
+    cleanText($("[itemprop='address']").first().text()) ||
+    cleanText($("[data-cy='address']").first().text());
 
   let contact = "N/A";
   const agentName =
     cleanText($("[data-cy='broker-name']").text()) ||
     cleanText($(".broker-name, .brokerName, .realtor-name").first().text());
   const phone =
-    cleanText($("[data-cy='broker-phone']").text()) || cleanText($("a[href^='tel:']").first().text());
+    cleanText($("[data-cy='broker-phone']").text()) ||
+    cleanText($("a[href^='tel:']").first().text());
   if (agentName || phone) contact = cleanText([agentName, phone].filter(Boolean).join(" - "));
 
   return {
@@ -492,87 +557,78 @@ function parseCentrisFromHtml(url, html) {
   };
 }
 
-// -------------------- DuProprio fast parser (JSON-LD first) --------------------
-function parseDuProprioFromHtmlFast(url, html) {
+// -------------------- DuProprio parser (cheerio) --------------------
+function parseDuProprioFromHtml(url, html) {
   const $ = load(html);
 
-  let price = "N/A";
-  const metaAmount =
-    cleanText($("meta[property='product:price:amount']").attr("content")) ||
-    cleanText($("meta[property='og:price:amount']").attr("content")) ||
-    cleanText($("meta[name='twitter:data1']").attr("content"));
-  if (metaAmount) {
-    const n = moneyToNumber(metaAmount);
-    if (n != null) price = formatMoney(n);
+  // 1) Price: prefer DOM (your screenshot), then meta
+  let price = cleanText($(".listing-price__amount").first().text()) || "N/A";
+
+  if (price === "N/A") {
+    const metaAmount =
+      cleanText($("meta[property='product:price:amount']").attr("content")) ||
+      cleanText($("meta[property='og:price:amount']").attr("content")) ||
+      cleanText($("meta[name='twitter:data1']").attr("content"));
+    if (metaAmount) {
+      const n = moneyToNumber(metaAmount);
+      if (n != null) price = formatMoney(n);
+    }
   }
 
-  let address = "";
+  if (price === "N/A") {
+    const metaText =
+      cleanText($("meta[property='og:description']").attr("content")) ||
+      cleanText($("meta[property='og:title']").attr("content")) ||
+      "";
+    const p = extractMoneyFromText(metaText);
+    if (p) price = p;
+  }
+
+  // 2) Characteristics (beds, baths, area)
   let beds = null;
   let baths = null;
   let area = null;
 
-  const scripts = $("script[type='application/ld+json']").toArray();
-  for (const s of scripts) {
-    const raw = $(s).text();
-    if (!raw) continue;
+  const items = $(".listing-main-characteristics__item").toArray();
+  for (const el of items) {
+    const $el = $(el);
+    const number = cleanText($el.find(".listing-main-characteristics__number").first().text());
+    const title = cleanText($el.find(".listing-main-characteristics__title").first().text()).toLowerCase();
+    const cls = ($el.attr("class") || "").toLowerCase();
 
-    let data;
-    try {
-      data = JSON.parse(raw);
-    } catch {
-      continue;
+    if (!beds && (title.includes("bedroom") || title.includes("bedrooms"))) {
+      const n = Number(number.replace(/[^\d.]/g, ""));
+      if (Number.isFinite(n)) beds = n;
     }
-
-    const nodes = Array.isArray(data) ? data : [data];
-    for (const node of nodes) {
-      const addr = node?.address || node?.location?.address || node?.offers?.itemOffered?.address || null;
-      const street = addr?.streetAddress || null;
-      const locality = addr?.addressLocality || "";
-      const region = addr?.addressRegion || "";
-      const postal = addr?.postalCode || "";
-
-      if (!address && street) {
-        const parts = [street, locality, region, postal].map(cleanText).filter(Boolean);
-        const out = parts.join(", ");
-        if (looksLikeRealAddress(out)) address = out;
-      }
-
-      const floorSize = node?.floorSize?.value || node?.floorSize?.amount || node?.floorSize || null;
-      if (!area && floorSize != null) {
-        const v = typeof floorSize === "number" ? String(floorSize) : cleanText(String(floorSize));
-        if (v) area = normalizeAreaToFt2(v);
-      }
-
-      const additional = node?.additionalProperty || node?.additionalProperties || null;
-      const addArr = Array.isArray(additional) ? additional : additional ? [additional] : [];
-
-      for (const ap of addArr) {
-        const name = cleanText(ap?.name || ap?.propertyID || "").toLowerCase();
-        const val = ap?.value ?? ap?.valueText ?? ap?.valueReference ?? "";
-        const v = cleanText(String(val));
-
-        if (!beds && (name.includes("bed") || name.includes("bedroom"))) {
-          const n = Number(v.replace(/[^\d.]/g, ""));
-          if (Number.isFinite(n)) beds = n;
-        }
-        if (!baths && (name.includes("bath") || name.includes("bathroom"))) {
-          const n = Number(v.replace(/[^\d.]/g, ""));
-          if (Number.isFinite(n)) baths = n;
-        }
-        if (!area && (name.includes("area") || name.includes("surface") || name.includes("size"))) {
-          if (v) area = normalizeAreaToFt2(v);
-        }
-      }
-
-      if (!area) {
-        const desc = cleanText(node?.description || "");
-        const m = desc.match(/\b([\d,]+)\s*(?:ft²|sqft)\b/i);
-        if (m) area = `${m[1]} ft²`;
-      }
+    if (!baths && (title.includes("bathroom") || title.includes("bathrooms") || title === "bath")) {
+      const n = Number(number.replace(/[^\d.]/g, ""));
+      if (Number.isFinite(n)) baths = n;
+    }
+    if (!area && (cls.includes("item-dimensions") || number.includes("ft²") || number.toLowerCase().includes("sqft"))) {
+      area = normalizeAreaToFt2(number);
     }
   }
 
-  const condoFees = "N/A";
+  // 3) Condo fees: best effort selector + small text scan fallback
+  let condoFees =
+    cleanText($(".listing-fees__amount").first().text()) ||
+    cleanText($(".listing-financial__amount").first().text()) ||
+    "N/A";
+
+  if (condoFees === "N/A") {
+    const body = cleanText($("body").text());
+    const m = body.match(/condo fees[^$]{0,40}(\$\s*[\d\s,]{2,}(?:\.\d{2})?)/i);
+    if (m && m[1]) condoFees = m[1];
+    const mFr = body.match(/frais de condo[^$]{0,40}(\$\s*[\d\s,]{2,}(?:\.\d{2})?)/i);
+    if (condoFees === "N/A" && mFr && mFr[1]) condoFees = mFr[1];
+  }
+  condoFees = ensureMonthlyFeesString(condoFees);
+
+  // 4) Address + contact
+  let address =
+    cleanText($(".listing-address").first().text()) ||
+    cleanText($("[class*='listing-address']").first().text()) ||
+    "";
 
   let contact = "N/A";
   const tel = cleanText($("a[href^='tel:']").first().text());
@@ -587,54 +643,27 @@ function parseDuProprioFromHtmlFast(url, html) {
     baths: Number.isFinite(baths) ? baths : null,
     levels: null,
     area: area ? normalizeAreaToFt2(area) : null,
-    condoFees: ensureMonthlyFeesString(condoFees),
+    condoFees,
     contact,
   };
 }
 
 function parseDuProprioFromStructured(url, structured) {
+  // Price: DOM first, then meta
   let price = "N/A";
-  const metaAmount = cleanText(structured?.metaAmount || "");
-  if (metaAmount) {
-    const n = moneyToNumber(metaAmount);
-    if (n != null) price = formatMoney(n);
-  }
 
-  let address = "";
-  let beds = null;
-  let baths = null;
-  let area = null;
+  const domPrice = cleanText(structured?.domPriceText || "");
+  if (domPrice) price = domPrice;
 
-  const blocks = Array.isArray(structured?.ldjson) ? structured.ldjson : [];
-  for (const raw of blocks) {
-    let data;
-    try {
-      data = JSON.parse(raw);
-    } catch {
-      continue;
-    }
-    const nodes = Array.isArray(data) ? data : [data];
-    for (const node of nodes) {
-      const addr = node?.address || node?.location?.address || node?.offers?.itemOffered?.address || null;
-      const street = addr?.streetAddress || null;
-      const locality = addr?.addressLocality || "";
-      const region = addr?.addressRegion || "";
-      const postal = addr?.postalCode || "";
-
-      if (!address && street) {
-        const parts = [street, locality, region, postal].map(cleanText).filter(Boolean);
-        const out = parts.join(", ");
-        if (looksLikeRealAddress(out)) address = out;
-      }
-
-      const desc = cleanText(node?.description || "");
-      if (!area) {
-        const m = desc.match(/\b([\d,]+)\s*(?:ft²|sqft)\b/i);
-        if (m) area = `${m[1]} ft²`;
-      }
+  if (price === "N/A") {
+    const metaAmount = cleanText(structured?.metaAmount || "");
+    if (metaAmount) {
+      const n = moneyToNumber(metaAmount);
+      if (n != null) price = formatMoney(n);
     }
   }
 
+  // Beds, baths, area: from structured text
   const b1 = cleanText(structured?.bedsText || "");
   const b2 = cleanText(structured?.bathsText || "");
   const d1 = cleanText(structured?.dimText || "");
@@ -642,25 +671,28 @@ function parseDuProprioFromStructured(url, structured) {
   const nb = b1 ? Number(b1.replace(/[^\d.]/g, "")) : null;
   const na = b2 ? Number(b2.replace(/[^\d.]/g, "")) : null;
 
-  if (Number.isFinite(nb)) beds = nb;
-  if (Number.isFinite(na)) baths = na;
-  if (d1) area = normalizeAreaToFt2(d1);
+  const beds = Number.isFinite(nb) ? nb : null;
+  const baths = Number.isFinite(na) ? na : null;
+  const area = d1 ? normalizeAreaToFt2(d1) : null;
 
-  if (!address) {
-    const maybe = cleanText(structured?.ogTitle || structured?.ogDesc || "");
-    if (looksLikeRealAddress(maybe)) address = maybe;
+  // Condo fees from structured scan
+  let condoFees = cleanText(structured?.condoFeesText || "") || "N/A";
+  if (condoFees && condoFees !== "N/A" && !condoFees.includes("$")) {
+    const maybe = extractMoneyFromText(condoFees);
+    if (maybe) condoFees = maybe;
   }
+  condoFees = ensureMonthlyFeesString(condoFees);
 
   return {
     url,
     source: "DuProprio",
-    address: address || "",
+    address: "",
     price,
-    beds: Number.isFinite(beds) ? beds : null,
-    baths: Number.isFinite(baths) ? baths : null,
+    beds,
+    baths,
     levels: null,
     area: area ? normalizeAreaToFt2(area) : null,
-    condoFees: "N/A",
+    condoFees,
     contact: "N/A",
   };
 }
@@ -679,19 +711,25 @@ async function scrapeCentris(url) {
 }
 
 async function scrapeDuProprio(url) {
-  const direct = await fetchHtmlDirect(url, 5500);
+  // Direct fetch sometimes still works, and is cheapest
+  const direct = await fetchHtmlDirect(url, 6500);
   if (direct.ok && !looksBlocked(direct.html)) {
-    return parseDuProprioFromHtmlFast(url, direct.html);
+    const parsed = parseDuProprioFromHtml(url, direct.html);
+    if (parsed.price !== "N/A" || parsed.beds != null || parsed.area != null) return parsed;
   }
 
+  // Playwright structured scrape (DOM selectors + small scan)
   const structured = await fetchDuProprioStructuredPlaywright(url);
-  if (structured && (structured.metaAmount || (structured.ldjson && structured.ldjson.length))) {
+  if (structured) {
     const parsed = parseDuProprioFromStructured(url, structured);
-    if (parsed.price && parsed.price !== "N/A") return parsed;
+    if (parsed.price !== "N/A" || parsed.beds != null || parsed.area != null) return parsed;
   }
 
-  const html = await fetchHtmlPlaywright(url);
-  return parseDuProprioFromHtmlFast(url, html);
+  // Last resort: full HTML from Playwright, then cheerio parse
+  const html = await fetchHtmlPlaywright(url, {
+    expectSelector: ".listing-price__amount, .listing-main-characteristics__item",
+  });
+  return parseDuProprioFromHtml(url, html);
 }
 
 // -------------------- API --------------------
@@ -726,7 +764,7 @@ app.get("/api/listing", async (req, res) => {
 
       let listing;
       if (src === "centris") listing = await withHardTimeout(scrapeCentris(url), 35000, "centris timeout");
-      else listing = await withHardTimeout(scrapeDuProprio(url), 30000, "duproprio timeout");
+      else listing = await withHardTimeout(scrapeDuProprio(url), 32000, "duproprio timeout");
 
       const safeScraped = sanitizeAddressOrBlank(listing.address);
       const finalAddress = safeScraped || cleanText(addressHint) || "N/A";
