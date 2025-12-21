@@ -12,19 +12,22 @@ const PORT = process.env.PORT || 3000;
 
 app.use(compression());
 
-// -------------------- CORS --------------------
+// -------------------- CORS (fix for joeymakesweb.com + www) --------------------
 const ALLOWED_ORIGINS = new Set([
   "https://joeymakesweb.com",
+  "https://www.joeymakesweb.com",
   "http://localhost:3000",
   "http://127.0.0.1:3000",
 ]);
 
 app.use((req, res, next) => {
   const origin = req.headers.origin;
+
   if (origin && ALLOWED_ORIGINS.has(origin)) {
     res.setHeader("Access-Control-Allow-Origin", origin);
     res.setHeader("Vary", "Origin");
   }
+
   res.setHeader("Access-Control-Allow-Methods", "GET,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
   next();
@@ -32,18 +35,18 @@ app.use((req, res, next) => {
 
 app.options("*", (req, res) => {
   const origin = req.headers.origin;
+
   if (origin && ALLOWED_ORIGINS.has(origin)) {
     res.setHeader("Access-Control-Allow-Origin", origin);
     res.setHeader("Vary", "Origin");
   }
+
   res.setHeader("Access-Control-Allow-Methods", "GET,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
   res.sendStatus(204);
 });
 
 // -------------------- Cache + in-flight dedupe --------------------
-// Use refresh=1 to bypass cache.
-// We also refuse to cache "bad" results (prevents 6h of garbage).
 const CACHE_TTL_MS = 6 * 60 * 60 * 1000; // 6 hours
 const cache = new Map(); // key -> { ts, data }
 const inflight = new Map(); // key -> Promise
@@ -85,7 +88,7 @@ function formatMoney(n) {
 
 function extractMoneyFromText(s) {
   const t = cleanText(s);
-  const m = t.match(/\$\s*[\d\s,]{3,}/); // "$579,000"
+  const m = t.match(/\$\s*[\d\s,]{3,}/);
   return m ? cleanText(m[0]) : "";
 }
 
@@ -261,14 +264,10 @@ async function ensureBrowser() {
       "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
     viewport: { width: 1280, height: 720 },
     locale: "en-CA",
-    extraHTTPHeaders: {
-      "Accept-Language": "en-CA,en;q=0.9",
-    },
+    extraHTTPHeaders: { "Accept-Language": "en-CA,en;q=0.9" },
   });
 
-  // Light anti-bot hardening
   await context.addInitScript(() => {
-    // eslint-disable-next-line no-undef
     Object.defineProperty(navigator, "webdriver", { get: () => undefined });
   });
 }
@@ -276,7 +275,7 @@ async function ensureBrowser() {
 async function enableFastRoutes(page) {
   await page.route("**/*", (route) => {
     const type = route.request().resourceType();
-    // Keep scripts + styles (some React apps behave weird if styles are blocked).
+    // Keep scripts + styles. Block images/fonts/media for speed.
     if (type === "image" || type === "media" || type === "font") return route.abort();
     return route.continue();
   });
@@ -288,7 +287,7 @@ function isExecutionContextDestroyed(err) {
   return msg.includes("Execution context was destroyed") || msg.includes("because of a navigation");
 }
 
-async function safeEvaluate(page, fn, { timeoutMs = 9000, retries = 2, label = "eval" } = {}) {
+async function safeEvaluate(page, fn, { timeoutMs = 10000, retries = 2, label = "eval" } = {}) {
   let lastErr;
   for (let i = 0; i <= retries; i += 1) {
     try {
@@ -325,7 +324,6 @@ async function gotoWithRetries(page, url, opts = {}) {
 
       if (attempt < tries) {
         await page.waitForTimeout(700);
-        // retry lighter "commit"
         try {
           await withHardTimeout(page.goto(url, { waitUntil: "commit" }), navTimeoutMs, "nav timeout");
           return;
@@ -340,24 +338,19 @@ async function gotoWithRetries(page, url, opts = {}) {
 }
 
 async function waitForAny(page, selectors, timeoutMs) {
-  // returns the selector that matched, or "" if none matched in time
-  try {
-    const winner = await Promise.race(
-      selectors.map((sel) =>
-        page
-          .waitForSelector(sel, { timeout: timeoutMs })
-          .then(() => sel)
-          .catch(() => null)
-      )
-    );
-    return winner || "";
-  } catch {
-    return "";
-  }
+  const tasks = selectors.map((sel) =>
+    page
+      .waitForSelector(sel, { timeout: timeoutMs })
+      .then(() => sel)
+      .catch(() => null)
+  );
+
+  const winner = await Promise.race(tasks);
+  return winner || "";
 }
 
 // -------------------- Playwright fetchers --------------------
-async function fetchHtmlPlaywright(url, { expectAnySelectors = [], waitUntil = "domcontentloaded" } = {}) {
+async function fetchHtmlPlaywright(url, { expectAnySelectors = [] } = {}) {
   await ensureBrowser();
   const page = await context.newPage();
 
@@ -367,23 +360,25 @@ async function fetchHtmlPlaywright(url, { expectAnySelectors = [], waitUntil = "
   await enableFastRoutes(page);
 
   try {
-    await gotoWithRetries(page, url, { navTimeoutMs: 30000, tries: 2, waitUntil });
+    await gotoWithRetries(page, url, { navTimeoutMs: 30000, tries: 2, waitUntil: "domcontentloaded" });
 
     if (expectAnySelectors.length) {
-      await waitForAny(page, expectAnySelectors, 16000);
+      await waitForAny(page, expectAnySelectors, 16000).catch(() => "");
       await page.waitForTimeout(200);
     } else {
       await page.waitForTimeout(250);
     }
 
     const html = await withHardTimeout(page.content(), 14000, "content timeout");
-    return { ok: true, html, finalUrl: page.url(), title: await page.title().catch(() => "") };
+    const title = await page.title().catch(() => "");
+    const finalUrl = page.url();
+
+    return { ok: true, html, title, finalUrl };
   } finally {
     await page.close().catch(() => {});
   }
 }
 
-// DuProprio structured scrape with resilient waits + fallback signals
 async function fetchDuProprioStructuredPlaywright(url) {
   await ensureBrowser();
   const page = await context.newPage();
@@ -396,8 +391,9 @@ async function fetchDuProprioStructuredPlaywright(url) {
   try {
     await gotoWithRetries(page, url, { navTimeoutMs: 30000, tries: 2, waitUntil: "domcontentloaded" });
 
-    // Instead of hard waiting for ONE selector, wait for ANY signal that the page is meaningful.
-    // If none appear, we still evaluate, then fall back to HTML parse.
+    // CRITICAL FIX:
+    // Do NOT hard wait for a single selector like .listing-price__amount.
+    // Wait for ANY signal, then evaluate anyway.
     await waitForAny(
       page,
       [
@@ -406,9 +402,11 @@ async function fetchDuProprioStructuredPlaywright(url) {
         "script[type='application/ld+json']",
         "meta[property='product:price:amount']",
         "meta[property='og:price:amount']",
+        "body",
       ],
       16000
-    );
+    ).catch(() => "");
+
     await page.waitForTimeout(200);
 
     const data = await safeEvaluate(
@@ -426,7 +424,6 @@ async function fetchDuProprioStructuredPlaywright(url) {
           getMeta("meta[name='twitter:data1']") ||
           "";
 
-        // characteristics
         let bedsText = "";
         let bathsText = "";
         let dimText = "";
@@ -445,11 +442,15 @@ async function fetchDuProprioStructuredPlaywright(url) {
           )
             bathsText = number;
 
-          const isDim = cls.includes("item-dimensions");
-          if (!dimText && (isDim || number.includes("ft²") || number.toLowerCase().includes("sqft"))) dimText = number;
+          if (
+            !dimText &&
+            (cls.includes("item-dimensions") || number.includes("ft²") || number.toLowerCase().includes("sqft"))
+          ) {
+            dimText = number;
+          }
         }
 
-        // condo fees: small scan
+        // Condo fees: targeted scan (bounded)
         let condoFeesText = "";
         const nodes = Array.from(document.querySelectorAll("div, span, li, p")).slice(0, 2600);
         for (let i = 0; i < nodes.length; i += 1) {
@@ -476,7 +477,7 @@ async function fetchDuProprioStructuredPlaywright(url) {
           .map((s) => s.textContent || "")
           .filter(Boolean);
 
-        // If domPriceText missing, try pull from any text chunk that looks like money near "listing-price"
+        // Weak fallback price (if dom selector not present but price is in text)
         let weakPrice = "";
         if (!domPriceText) {
           const bodyText = toLine(document.body?.innerText || "");
@@ -594,7 +595,6 @@ function parseCentrisFromHtml(url, html) {
 function parseDuProprioFromHtml(url, html) {
   const $ = load(html);
 
-  // price: DOM then meta then og
   let price = cleanText($(".listing-price__amount").first().text()) || "N/A";
 
   if (price === "N/A") {
@@ -617,7 +617,6 @@ function parseDuProprioFromHtml(url, html) {
     if (p) price = p;
   }
 
-  // characteristics
   let beds = null;
   let baths = null;
   let area = null;
@@ -642,7 +641,6 @@ function parseDuProprioFromHtml(url, html) {
     }
   }
 
-  // condo fees: selector + text fallback
   let condoFees =
     cleanText($(".listing-fees__amount").first().text()) ||
     cleanText($(".listing-financial__amount").first().text()) ||
@@ -657,11 +655,9 @@ function parseDuProprioFromHtml(url, html) {
   }
   condoFees = ensureMonthlyFeesString(condoFees);
 
-  // address
   let address =
     cleanText($(".listing-address").first().text()) || cleanText($("[class*='listing-address']").first().text()) || "";
 
-  // contact
   let contact = "N/A";
   const tel = cleanText($("a[href^='tel:']").first().text());
   if (tel) contact = tel;
@@ -743,35 +739,36 @@ async function scrapeCentris(url) {
 
   const pw = await fetchHtmlPlaywright(url, {
     expectAnySelectors: ["[data-cy='buyPrice']", "[data-cy='price']", "[data-cy='address']", "body"],
-    waitUntil: "domcontentloaded",
   });
 
-  if (!pw.ok || looksBlocked(pw.html)) {
-    throw new Error(`centris blocked or empty (title="${pw?.title || ""}" url="${pw?.finalUrl || ""}")`);
+  if (!pw.ok || !pw.html || pw.html.length < 1200 || looksBlocked(pw.html)) {
+    throw new Error(`centris blocked/empty (title="${pw?.title || ""}" url="${pw?.finalUrl || ""}")`);
   }
 
   return parseCentrisFromHtml(url, pw.html);
 }
 
 async function scrapeDuProprio(url) {
-  // 1) direct fetch if possible
+  // direct fetch if possible
   const direct = await fetchHtmlDirect(url, 6500);
   if (direct.ok && !looksBlocked(direct.html)) {
     const parsed = parseDuProprioFromHtml(url, direct.html);
     if (parsed.price !== "N/A" || parsed.beds != null || parsed.area != null) return parsed;
   }
 
-  // 2) structured playwright (resilient)
+  // structured playwright without brittle selector waits
   let structuredPayload = null;
   try {
     structuredPayload = await fetchDuProprioStructuredPlaywright(url);
-    const parsed = parseDuProprioFromStructured(url, structuredPayload);
-    if (parsed.price !== "N/A" || parsed.beds != null || parsed.area != null) return parsed;
-  } catch (e) {
+    if (structuredPayload?.ok) {
+      const parsed = parseDuProprioFromStructured(url, structuredPayload);
+      if (parsed.price !== "N/A" || parsed.beds != null || parsed.area != null) return parsed;
+    }
+  } catch {
     // continue to full HTML fallback
   }
 
-  // 3) full HTML playwright fallback
+  // full HTML playwright fallback
   const pw = await fetchHtmlPlaywright(url, {
     expectAnySelectors: [
       ".listing-price__amount",
@@ -780,21 +777,16 @@ async function scrapeDuProprio(url) {
       "meta[property='product:price:amount']",
       "body",
     ],
-    waitUntil: "domcontentloaded",
   });
 
-  const title = pw.title || "";
-  const finalUrl = pw.finalUrl || "";
-
   if (!pw.ok || !pw.html || pw.html.length < 1200 || looksBlocked(pw.html)) {
-    throw new Error(`duproprio blocked/empty (title="${title}" url="${finalUrl}")`);
+    throw new Error(`duproprio blocked/empty (title="${pw?.title || ""}" url="${pw?.finalUrl || ""}")`);
   }
 
   const parsed = parseDuProprioFromHtml(url, pw.html);
 
-  // If still empty, return diagnostics to help you see what headless saw
   if (parsed.price === "N/A" && parsed.beds == null && parsed.area == null) {
-    throw new Error(`duproprio missing fields (title="${title}" url="${finalUrl}")`);
+    throw new Error(`duproprio missing fields (title="${pw?.title || ""}" url="${pw?.finalUrl || ""}")`);
   }
 
   return parsed;
@@ -839,7 +831,7 @@ app.get("/api/listing", async (req, res) => {
       const finalAddress = safeScraped || cleanText(addressHint) || "N/A";
       const finalListing = { ...listing, address: finalAddress };
 
-      // Do not cache garbage
+      // Don't cache garbage results
       const looksGood =
         finalListing.price !== "N/A" ||
         finalListing.beds != null ||
@@ -849,10 +841,7 @@ app.get("/api/listing", async (req, res) => {
 
       if (looksGood) setCached(key, finalListing);
 
-      console.log(
-        `[scrape] ${src} ${Date.now() - t0}ms refresh=${refresh ? "1" : "0"} ${url}`
-      );
-
+      console.log(`[scrape] ${src} ${Date.now() - t0}ms refresh=${refresh ? "1" : "0"} ${url}`);
       return finalListing;
     } finally {
       scrapeGate.release();
