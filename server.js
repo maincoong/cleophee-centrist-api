@@ -42,6 +42,7 @@ app.options("*", (req, res) => {
 });
 
 // -------------------- Cache + in-flight dedupe --------------------
+// NOTE: cache can preserve bad scrapes. Provide refresh=1 to bypass.
 const CACHE_TTL_MS = 6 * 60 * 60 * 1000; // 6 hours
 const cache = new Map(); // key -> { ts, data }
 const inflight = new Map(); // key -> Promise
@@ -235,7 +236,7 @@ function looksBlocked(html) {
   return false;
 }
 
-// -------------------- Playwright global reuse (fallback only) --------------------
+// -------------------- Playwright global reuse --------------------
 let browser;
 let context;
 
@@ -251,6 +252,7 @@ async function ensureBrowser() {
     userAgent:
       "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
     viewport: { width: 1280, height: 720 },
+    locale: "en-CA",
   });
 }
 
@@ -270,7 +272,7 @@ function isExecutionContextDestroyed(err) {
   return msg.includes("Execution context was destroyed") || msg.includes("because of a navigation");
 }
 
-async function safeEvaluate(page, fn, { timeoutMs = 6500, retries = 2, label = "eval" } = {}) {
+async function safeEvaluate(page, fn, { timeoutMs = 8000, retries = 2, label = "eval" } = {}) {
   let lastErr;
   for (let i = 0; i <= retries; i += 1) {
     try {
@@ -287,7 +289,7 @@ async function safeEvaluate(page, fn, { timeoutMs = 6500, retries = 2, label = "
 }
 
 async function gotoWithRetries(page, url, opts = {}) {
-  const { navTimeoutMs = 25000, tries = 2, waitUntil = "domcontentloaded" } = opts;
+  const { navTimeoutMs = 28000, tries = 2, waitUntil = "domcontentloaded" } = opts;
   let lastErr;
 
   for (let attempt = 0; attempt <= tries; attempt += 1) {
@@ -296,7 +298,6 @@ async function gotoWithRetries(page, url, opts = {}) {
       return;
     } catch (e) {
       lastErr = e;
-
       const msg = String(e?.message || e || "");
       const isTimeout = msg.toLowerCase().includes("timeout");
       if (!isTimeout) throw e;
@@ -322,7 +323,7 @@ async function gotoWithRetries(page, url, opts = {}) {
 }
 
 // -------------------- Playwright fetchers --------------------
-async function fetchHtmlPlaywright(url, { expectSelector } = {}) {
+async function fetchHtmlPlaywright(url, { expectSelector, waitUntil = "domcontentloaded" } = {}) {
   await ensureBrowser();
   const page = await context.newPage();
 
@@ -332,21 +333,23 @@ async function fetchHtmlPlaywright(url, { expectSelector } = {}) {
   await enableFastRoutes(page);
 
   try {
-    await gotoWithRetries(page, url, { navTimeoutMs: 25000, tries: 2, waitUntil: "domcontentloaded" });
+    await gotoWithRetries(page, url, { navTimeoutMs: 28000, tries: 2, waitUntil });
 
     if (expectSelector) {
-      await page.waitForSelector(expectSelector, { timeout: 6000 }).catch(() => {});
+      await page.waitForSelector(expectSelector, { timeout: 15000 });
+      await page.waitForTimeout(150); // settle
     } else {
       await page.waitForTimeout(250);
     }
 
-    const html = await withHardTimeout(page.content(), 9000, "content timeout");
+    const html = await withHardTimeout(page.content(), 12000, "content timeout");
     return html;
   } finally {
     await page.close().catch(() => {});
   }
 }
 
+// Structured DuProprio scrape: uses *real* DOM selectors (price + characteristics + fees best-effort)
 async function fetchDuProprioStructuredPlaywright(url) {
   await ensureBrowser();
   const page = await context.newPage();
@@ -357,18 +360,19 @@ async function fetchDuProprioStructuredPlaywright(url) {
   await enableFastRoutes(page);
 
   try {
-    await gotoWithRetries(page, url, { navTimeoutMs: 25000, tries: 2, waitUntil: "domcontentloaded" });
+    await gotoWithRetries(page, url, { navTimeoutMs: 28000, tries: 2, waitUntil: "domcontentloaded" });
 
-    // These are the real DOM nodes you showed in devtools
-    await page.waitForSelector(".listing-price__amount", { timeout: 6500 }).catch(() => {});
-    await page.waitForSelector(".listing-main-characteristics__item", { timeout: 6500 }).catch(() => {});
-    await page.waitForSelector("script[type='application/ld+json']", { timeout: 6500 }).catch(() => {});
+    // STRICT waits (do not swallow). If these don't appear, we want to fall back.
+    await page.waitForSelector(".listing-price__amount", { timeout: 15000 });
+    await page.waitForSelector(".listing-main-characteristics__item", { timeout: 15000 });
+    await page.waitForTimeout(150);
 
     const data = await safeEvaluate(
       page,
       () => {
         const getMeta = (sel) => document.querySelector(sel)?.getAttribute("content") || "";
         const getText = (sel) => (document.querySelector(sel)?.textContent || "").trim();
+        const toLine = (s) => (s || "").replace(/\s+/g, " ").trim();
 
         const metaAmount =
           getMeta("meta[property='product:price:amount']") ||
@@ -376,83 +380,77 @@ async function fetchDuProprioStructuredPlaywright(url) {
           getMeta("meta[name='twitter:data1']") ||
           "";
 
-        const ld = Array.from(document.querySelectorAll("script[type='application/ld+json']"))
-          .map((s) => s.textContent || "")
-          .filter(Boolean);
+        const domPriceText = toLine(getText(".listing-price__amount"));
 
-        const domPriceText = getText(".listing-price__amount");
-
-        // Characteristics: gather from the "item" blocks
+        // Characteristics: parse the blocks exactly like your devtools screenshots
         let bedsText = "";
         let bathsText = "";
         let dimText = "";
 
         const items = Array.from(document.querySelectorAll(".listing-main-characteristics__item"));
         for (const item of items) {
-          const isDim = item.className.includes("item-dimensions");
-          const number = (item.querySelector(".listing-main-characteristics__number")?.textContent || "").trim();
-          const title = (item.querySelector(".listing-main-characteristics__title")?.textContent || "").trim();
+          const number = toLine(item.querySelector(".listing-main-characteristics__number")?.textContent || "");
+          const title = toLine(item.querySelector(".listing-main-characteristics__title")?.textContent || "");
+          const titleLower = title.toLowerCase();
+          const cls = (item.getAttribute("class") || "").toLowerCase();
 
-          const t = title.toLowerCase();
-          if (!bedsText && (t.includes("bedroom") || t.includes("bedrooms"))) bedsText = number;
-          if (!bathsText && (t.includes("bathroom") || t.includes("bathrooms") || t === "bath")) bathsText = number;
+          if (!bedsText && (titleLower === "bedrooms" || titleLower.includes("bedroom"))) bedsText = number;
+          if (!bathsText && (titleLower === "bathrooms" || titleLower.includes("bathroom") || titleLower === "bath"))
+            bathsText = number;
 
-          // Dimensions block sometimes has no title, but has the number span
-          if (!dimText && isDim && number) dimText = number;
-
-          // If title is blank but number contains ft², treat as dimensions
-          if (!dimText && number && (number.includes("ft²") || number.toLowerCase().includes("sqft"))) dimText = number;
+          // dimensions block: either class contains item-dimensions or number includes ft²/sqft
+          const isDim = cls.includes("item-dimensions");
+          if (!dimText && (isDim || number.includes("ft²") || number.toLowerCase().includes("sqft"))) dimText = number;
         }
 
-        // Condo fees: best effort.
-        // DuProprio layouts vary, so do a small targeted text scan without returning full body text.
-        let condoFeesText = "";
-        const candidates = Array.from(document.querySelectorAll("div, span, li, p"))
-          .slice(0, 2500) // limit work
-          .map((n) => (n.textContent || "").replace(/\s+/g, " ").trim())
-          .filter(Boolean);
+        // Condo fees (best effort):
+        // Try a few likely elements first (cheap), then a limited scan.
+        let condoFeesText =
+          toLine(getText(".listing-fees__amount")) ||
+          toLine(getText(".listing-financial__amount")) ||
+          toLine(getText("[data-testid*='condo']")) ||
+          "";
 
-        for (let i = 0; i < candidates.length; i += 1) {
-          const line = candidates[i];
-          const low = line.toLowerCase();
-          if (low.includes("condo fees") || low.includes("condominium fees") || low.includes("frais de condo")) {
-            // Try same line first: "Condo fees $XXX"
-            const m = line.match(/\$\s*[\d\s,]{2,}(?:\.\d{2})?/);
-            if (m) {
-              condoFeesText = m[0];
-              break;
-            }
-            // Try the next line as value
-            const next = candidates[i + 1] || "";
-            const m2 = next.match(/\$\s*[\d\s,]{2,}(?:\.\d{2})?/);
-            if (m2) {
-              condoFeesText = m2[0];
-              break;
+        if (!condoFeesText) {
+          const nodes = Array.from(document.querySelectorAll("div, span, li, p")).slice(0, 2500);
+          for (let i = 0; i < nodes.length; i += 1) {
+            const line = toLine(nodes[i].textContent || "");
+            const low = line.toLowerCase();
+            if (!line) continue;
+
+            if (low.includes("condo fees") || low.includes("condominium fees") || low.includes("frais de condo")) {
+              const m = line.match(/\$\s*[\d\s,]{2,}(?:\.\d{2})?/);
+              if (m) {
+                condoFeesText = m[0];
+                break;
+              }
+              // look ahead
+              const next = toLine(nodes[i + 1]?.textContent || "");
+              const m2 = next.match(/\$\s*[\d\s,]{2,}(?:\.\d{2})?/);
+              if (m2) {
+                condoFeesText = m2[0];
+                break;
+              }
             }
           }
         }
 
-        // If still nothing, try a smaller selector guess that exists on some listings
-        if (!condoFeesText) {
-          const feeGuess =
-            getText(".listing-fees__amount") ||
-            getText(".listing-financial__amount") ||
-            getText("[class*='condo'][class*='fees']") ||
-            "";
-          condoFeesText = feeGuess;
-        }
+        // JSON-LD kept as optional (sometimes useful for address)
+        const ld = Array.from(document.querySelectorAll("script[type='application/ld+json']"))
+          .map((s) => s.textContent || "")
+          .filter(Boolean);
 
         return {
           metaAmount,
-          ldjson: ld,
           domPriceText,
           bedsText,
           bathsText,
           dimText,
           condoFeesText,
+          ldjson: ld,
         };
       },
-      { timeoutMs: 8000, retries: 2, label: "dp structured eval" }
+      { timeoutMs: 9000, retries: 2, label: "dp structured eval" }
     );
 
     return data;
@@ -561,7 +559,7 @@ function parseCentrisFromHtml(url, html) {
 function parseDuProprioFromHtml(url, html) {
   const $ = load(html);
 
-  // 1) Price: prefer DOM (your screenshot), then meta
+  // Price: DOM first, then meta
   let price = cleanText($(".listing-price__amount").first().text()) || "N/A";
 
   if (price === "N/A") {
@@ -584,7 +582,7 @@ function parseDuProprioFromHtml(url, html) {
     if (p) price = p;
   }
 
-  // 2) Characteristics (beds, baths, area)
+  // Characteristics
   let beds = null;
   let baths = null;
   let area = null;
@@ -609,7 +607,7 @@ function parseDuProprioFromHtml(url, html) {
     }
   }
 
-  // 3) Condo fees: best effort selector + small text scan fallback
+  // Condo fees: selector + text fallback
   let condoFees =
     cleanText($(".listing-fees__amount").first().text()) ||
     cleanText($(".listing-financial__amount").first().text()) ||
@@ -617,14 +615,14 @@ function parseDuProprioFromHtml(url, html) {
 
   if (condoFees === "N/A") {
     const body = cleanText($("body").text());
-    const m = body.match(/condo fees[^$]{0,40}(\$\s*[\d\s,]{2,}(?:\.\d{2})?)/i);
+    const m = body.match(/condo fees[^$]{0,60}(\$\s*[\d\s,]{2,}(?:\.\d{2})?)/i);
     if (m && m[1]) condoFees = m[1];
-    const mFr = body.match(/frais de condo[^$]{0,40}(\$\s*[\d\s,]{2,}(?:\.\d{2})?)/i);
+    const mFr = body.match(/frais de condo[^$]{0,60}(\$\s*[\d\s,]{2,}(?:\.\d{2})?)/i);
     if (condoFees === "N/A" && mFr && mFr[1]) condoFees = mFr[1];
   }
   condoFees = ensureMonthlyFeesString(condoFees);
 
-  // 4) Address + contact
+  // Address + contact
   let address =
     cleanText($(".listing-address").first().text()) ||
     cleanText($("[class*='listing-address']").first().text()) ||
@@ -649,9 +647,8 @@ function parseDuProprioFromHtml(url, html) {
 }
 
 function parseDuProprioFromStructured(url, structured) {
-  // Price: DOM first, then meta
+  // Price: DOM first
   let price = "N/A";
-
   const domPrice = cleanText(structured?.domPriceText || "");
   if (domPrice) price = domPrice;
 
@@ -663,7 +660,7 @@ function parseDuProprioFromStructured(url, structured) {
     }
   }
 
-  // Beds, baths, area: from structured text
+  // Beds/baths/area
   const b1 = cleanText(structured?.bedsText || "");
   const b2 = cleanText(structured?.bathsText || "");
   const d1 = cleanText(structured?.dimText || "");
@@ -673,9 +670,10 @@ function parseDuProprioFromStructured(url, structured) {
 
   const beds = Number.isFinite(nb) ? nb : null;
   const baths = Number.isFinite(na) ? na : null;
+
   const area = d1 ? normalizeAreaToFt2(d1) : null;
 
-  // Condo fees from structured scan
+  // Condo fees
   let condoFees = cleanText(structured?.condoFeesText || "") || "N/A";
   if (condoFees && condoFees !== "N/A" && !condoFees.includes("$")) {
     const maybe = extractMoneyFromText(condoFees);
@@ -691,7 +689,7 @@ function parseDuProprioFromStructured(url, structured) {
     beds,
     baths,
     levels: null,
-    area: area ? normalizeAreaToFt2(area) : null,
+    area,
     condoFees,
     contact: "N/A",
   };
@@ -706,28 +704,34 @@ async function scrapeCentris(url) {
 
   const html = await fetchHtmlPlaywright(url, {
     expectSelector: "[data-cy='buyPrice'], [data-cy='price'], [data-cy='address']",
+    waitUntil: "domcontentloaded",
   });
   return parseCentrisFromHtml(url, html);
 }
 
 async function scrapeDuProprio(url) {
-  // Direct fetch sometimes still works, and is cheapest
+  // 1) Direct fetch: cheap
   const direct = await fetchHtmlDirect(url, 6500);
   if (direct.ok && !looksBlocked(direct.html)) {
     const parsed = parseDuProprioFromHtml(url, direct.html);
     if (parsed.price !== "N/A" || parsed.beds != null || parsed.area != null) return parsed;
   }
 
-  // Playwright structured scrape (DOM selectors + small scan)
-  const structured = await fetchDuProprioStructuredPlaywright(url);
-  if (structured) {
+  // 2) Structured Playwright (best)
+  try {
+    const structured = await fetchDuProprioStructuredPlaywright(url);
     const parsed = parseDuProprioFromStructured(url, structured);
+    // Helpful debug (comment out later)
+    // console.log("[dp structured]", structured);
     if (parsed.price !== "N/A" || parsed.beds != null || parsed.area != null) return parsed;
+  } catch {
+    // fall through
   }
 
-  // Last resort: full HTML from Playwright, then cheerio parse
+  // 3) Full HTML Playwright with selector wait
   const html = await fetchHtmlPlaywright(url, {
     expectSelector: ".listing-price__amount, .listing-main-characteristics__item",
+    waitUntil: "domcontentloaded",
   });
   return parseDuProprioFromHtml(url, html);
 }
@@ -736,6 +740,7 @@ async function scrapeDuProprio(url) {
 app.get("/api/listing", async (req, res) => {
   const url = String(req.query.url || "").trim();
   const addressHint = String(req.query.addressHint || "").trim();
+  const refresh = String(req.query.refresh || "").trim() === "1";
 
   if (!url) return res.status(400).json({ ok: false, error: "Missing url parameter." });
 
@@ -744,10 +749,10 @@ app.get("/api/listing", async (req, res) => {
 
   const key = makeCacheKey(url, addressHint);
 
-  const cached = getCached(key);
+  const cached = !refresh ? getCached(key) : null;
   if (cached) return res.json({ ok: true, listing: cached, cached: true });
 
-  const existing = inflight.get(key);
+  const existing = !refresh ? inflight.get(key) : null;
   if (existing) {
     try {
       const listing = await withHardTimeout(existing, 30000, "inflight timeout");
@@ -763,16 +768,28 @@ app.get("/api/listing", async (req, res) => {
       const t0 = Date.now();
 
       let listing;
-      if (src === "centris") listing = await withHardTimeout(scrapeCentris(url), 35000, "centris timeout");
-      else listing = await withHardTimeout(scrapeDuProprio(url), 32000, "duproprio timeout");
+      if (src === "centris") listing = await withHardTimeout(scrapeCentris(url), 38000, "centris timeout");
+      else listing = await withHardTimeout(scrapeDuProprio(url), 36000, "duproprio timeout");
 
       const safeScraped = sanitizeAddressOrBlank(listing.address);
       const finalAddress = safeScraped || cleanText(addressHint) || "N/A";
       const finalListing = { ...listing, address: finalAddress };
 
-      setCached(key, finalListing);
+      // Only cache if it looks like a "real" scrape (prevents caching empty garbage)
+      const looksGood =
+        finalListing.price !== "N/A" ||
+        finalListing.beds != null ||
+        finalListing.baths != null ||
+        (finalListing.area && finalListing.area !== "N/A");
 
-      console.log(`[scrape] ${src} ${Date.now() - t0}ms ${url}`);
+      if (looksGood) {
+        setCached(key, finalListing);
+      } else {
+        // If you want: cache short for errors instead of 6 hours.
+        // Here we simply do not cache bad results.
+      }
+
+      console.log(`[scrape] ${src} ${Date.now() - t0}ms refresh=${refresh ? "1" : "0"} ${url}`);
       return finalListing;
     } finally {
       scrapeGate.release();
@@ -783,7 +800,7 @@ app.get("/api/listing", async (req, res) => {
 
   try {
     const listing = await p;
-    return res.json({ ok: true, listing, cached: false });
+    return res.json({ ok: true, listing, cached: false, refresh });
   } catch (e) {
     return res.status(500).json({ ok: false, error: `Scrape failed: ${e?.message || e}` });
   } finally {
@@ -797,6 +814,7 @@ app.get("/", (req, res) => {
 });
 
 app.listen(PORT, async () => {
+  // Warm Playwright
   try {
     await ensureBrowser();
   } catch (e) {
